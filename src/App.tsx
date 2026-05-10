@@ -135,6 +135,7 @@ export function App() {
   const [savedContexts, setSavedContexts] = useState<CoreContextFragment[]>([]);
   const [activeSessionId, setActiveSessionId] = useState("");
   const [searchTerm, setSearchTerm] = useState("");
+  const [providerFilter, setProviderFilter] = useState<"all" | "codex" | "claude">("all");
   const [sessionLoadState, setSessionLoadState] = useState<LoadState>({ state: "idle" });
   const [contextLoadState, setContextLoadState] = useState<LoadState>({ state: "idle" });
   const [detailState, setDetailState] = useState<SessionDetailState>({ state: "idle" });
@@ -149,12 +150,16 @@ export function App() {
 
   const filteredSessions = useMemo(() => {
     const normalized = searchTerm.trim().toLowerCase();
-    if (!normalized) {
-      return sessions;
-    }
+    return sessions.filter((session) => {
+      if (providerFilter !== "all" && session.provider !== providerFilter) {
+        return false;
+      }
 
-    return sessions.filter((session) =>
-      [
+      if (!normalized) {
+        return true;
+      }
+
+      return [
         session.provider,
         session.title,
         session.sessionId,
@@ -164,9 +169,9 @@ export function App() {
       ]
         .join(" ")
         .toLowerCase()
-        .includes(normalized)
-    );
-  }, [searchTerm, sessions]);
+        .includes(normalized);
+    });
+  }, [providerFilter, searchTerm, sessions]);
 
   const activeSession =
     sessions.find((session) => session.sessionId === activeSessionId) ?? sessions[0];
@@ -271,6 +276,27 @@ export function App() {
     }
   }
 
+  async function copySavedContext(context: CoreContextFragment) {
+    setCopyState({ state: "running", message: "복사 중" });
+
+    try {
+      await navigator.clipboard.writeText(context.content);
+      setCopyState({ state: "success", message: "저장된 세션 컨텍스트를 복사했습니다." });
+    } catch (error: unknown) {
+      setCopyState({ state: "error", message: formatError(error) });
+    }
+  }
+
+  function openSavedContext(context: CoreContextFragment) {
+    setDraftContent(context.content);
+    setDetailState({ state: "idle" });
+    setSaveState({ state: "idle" });
+    setCopyState({
+      state: "success",
+      message: `${context.title}을(를) 편집 초안으로 열었습니다.`
+    });
+  }
+
   async function saveDraftContext() {
     if (detailState.state !== "ready" || !draftContent.trim()) {
       return;
@@ -313,10 +339,10 @@ export function App() {
       <header className="session-hero">
         <div>
           <p className="eyebrow">Session Context Reuse</p>
-          <h1>끝난 작업 세션을 새 작업의 출발점으로</h1>
+          <h1>이전 작업을 새 세션에 바로 이어붙이기</h1>
           <p>
-            Codex/Claude resume 로그에서 필요한 맥락만 뽑아 새 세션에 바로 붙여 넣거나
-            프로젝트 로컬 컨텍스트로 저장합니다.
+            끝난 Codex/Claude 작업 세션을 고르면 새 세션에 붙여넣기 좋은 맥락 초안을 만듭니다.
+            필요 없는 부분만 덜어내고 복사하거나 저장하세요.
           </p>
         </div>
         <button type="button" onClick={() => void refreshSessions()}>
@@ -324,6 +350,21 @@ export function App() {
           세션 새로고침
         </button>
       </header>
+
+      <section className="workflow-guide" aria-label="사용 흐름">
+        <article>
+          <strong>1. 이전 세션 선택</strong>
+          <p>프로젝트명, 요청 내용, 작업 폴더로 찾습니다.</p>
+        </article>
+        <article>
+          <strong>2. 초안 확인</strong>
+          <p>목표, 결정, 변경 내용이 들어간 새 세션용 문맥을 다듬습니다.</p>
+        </article>
+        <article>
+          <strong>3. 새 세션에 사용</strong>
+          <p>복사해서 붙여넣거나 프로젝트에 저장해 다시 꺼냅니다.</p>
+        </article>
+      </section>
 
       <section className="summary-grid session-summary-grid" aria-label="세션 요약">
         <Metric icon={<MessageSquareText aria-hidden="true" />} label="발견한 세션" value={stats.sessionCount} />
@@ -349,7 +390,20 @@ export function App() {
               onChange={(event) => setSearchTerm(event.target.value)}
             />
           </label>
+          <div className="filter-pills" aria-label="세션 종류 필터">
+            {(["all", "codex", "claude"] as const).map((provider) => (
+              <button
+                type="button"
+                className={providerFilter === provider ? "filter-pill active" : "filter-pill"}
+                key={provider}
+                onClick={() => setProviderFilter(provider)}
+              >
+                {provider === "all" ? "전체" : formatProvider(provider)}
+              </button>
+            ))}
+          </div>
           <StatusLine state={sessionLoadState} />
+          {activeSession ? <ActiveSessionCard session={activeSession} /> : null}
           <div className="session-list">
             {filteredSessions.map((session) => (
               <button
@@ -401,7 +455,7 @@ export function App() {
                 onClick={() => void copyDraft()}
               >
                 <Clipboard aria-hidden="true" />
-                복사
+                새 세션에 붙여넣기
               </button>
               <button
                 type="button"
@@ -413,7 +467,7 @@ export function App() {
                 onClick={() => void saveDraftContext()}
               >
                 <FileDown aria-hidden="true" />
-                프로젝트에 저장
+                나중에 쓰도록 저장
               </button>
             </div>
           </div>
@@ -439,7 +493,23 @@ export function App() {
                 <strong>{context.title}</strong>
                 <small>{context.file_path}</small>
               </div>
-              <em>{context.vault_scope}</em>
+              <div className="saved-context-actions">
+                <em>{context.vault_scope}</em>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => openSavedContext(context)}
+                >
+                  초안으로 열기
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void copySavedContext(context)}
+                >
+                  <Clipboard aria-hidden="true" />
+                  복사
+                </button>
+              </div>
             </article>
           ))}
           {savedContexts.length === 0 && contextLoadState.state !== "loading" ? (
@@ -469,6 +539,29 @@ function Metric({
         <span>{value}</span>
         <p>{label}</p>
       </div>
+    </article>
+  );
+}
+
+function ActiveSessionCard({ session }: { session: AgentSessionSummary }) {
+  return (
+    <article className="active-session-card" aria-label="현재 선택된 세션">
+      <div>
+        <p className="eyebrow">선택됨</p>
+        <strong>{session.title}</strong>
+        <small>{session.cwd ?? session.filePath}</small>
+      </div>
+      <dl>
+        <div>
+          <dt>종류</dt>
+          <dd>{formatProvider(session.provider)}</dd>
+        </div>
+        <div>
+          <dt>메시지</dt>
+          <dd>{session.messageCount}개</dd>
+        </div>
+      </dl>
+      {session.lastUserMessage ? <p>{session.lastUserMessage}</p> : null}
     </article>
   );
 }
