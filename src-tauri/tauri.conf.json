@@ -1,0 +1,37 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CTX Context Manager",
+  "version": "0.1.0",
+  "identifier": "com.ctx.session-management",
+  "build": {
+    "beforeDevCommand": "npm run build:sidecar && npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build:tauri-assets",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "CTX Context Manager",
+        "width": 1280,
+        "height": 860,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "DeveloperTool",
+    "shortDescription": "Manage markdown-based AI agent contexts.",
+    "longDescription": "CTX manages global and project-local markdown context vaults, presets, and CLI launch injection for AI agent workflows.",
+    "externalBin": [
+      "bin/ctx"
+    ]
+  }
+}

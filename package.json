@@ -1,0 +1,53 @@
+{
+  "name": "ctx-session-management-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Tauri + React desktop app for managing markdown-based AI agent contexts.",
+  "scripts": {
+    "install:deps": "npm install && cargo fetch",
+    "dev": "vite",
+    "dev:react": "vite",
+    "dev:desktop": "tauri dev",
+    "build:sidecar": "bash src-tauri/scripts/build-sidecar.sh",
+    "build:sidecar:release": "CTX_SIDECAR_PROFILE=release bash src-tauri/scripts/build-sidecar.sh",
+    "lint:frontend": "node scripts/verify-frontend.mjs lint",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
+    "test:frontend": "node scripts/verify-frontend.mjs test",
+    "check:frontend": "npm run lint:frontend && npm run typecheck && npm run test:frontend",
+    "format:rust:check": "cargo fmt --all -- --check",
+    "lint:rust": "cargo clippy --workspace --all-targets -- -D warnings",
+    "test:rust": "cargo test --workspace",
+    "check:rust": "npm run format:rust:check && cargo check --workspace && npm run lint:rust && npm run test:rust",
+    "check:tauri": "cargo check -p ctx-desktop",
+    "verify:rust": "bash scripts/verify-rust.sh",
+    "verify": "npm run check:frontend && npm run check:rust && npm run check:tauri",
+    "check": "npm run verify",
+    "build": "npm run typecheck && vite build",
+    "build:desktop": "tauri build",
+    "build:tauri-assets": "npm run build:sidecar:release && npm run build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.5.0",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.5.0",
+    "@types/react": "^18.3.17",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  }
+}

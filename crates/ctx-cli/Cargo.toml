@@ -1,0 +1,20 @@
+[package]
+name = "ctx-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Bundled ctx command-line wrapper for AI agent context sessions."
+default-run = "ctx"
+
+[[bin]]
+name = "ctx"
+path = "src/bin/ctx.rs"
+
+[dependencies]
+ctx-core.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
