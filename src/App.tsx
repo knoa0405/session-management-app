@@ -7,23 +7,23 @@ import {
   FileDown,
   LoaderCircle,
   MessageSquareText,
+  Rocket,
   RefreshCw,
-  Search
+  Search,
+  Sparkles
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-
-type VaultScope = "global" | "local";
-
-type CoreContextFragment = {
-  context_id: string;
-  title: string;
-  content: string;
-  file_path: string;
-  vault_scope: VaultScope;
-  tags: string[];
-  folder_path: string;
-};
+import {
+  listSavedSessionHandoffContexts,
+  openSavedSessionHandoffContext,
+  saveAgentSessionHandoffContext,
+  type CoreContextFragment,
+  type SavedSessionHandoffContext,
+  type SessionClassificationMetadata,
+  type SessionClassificationStatus,
+  type SessionHandoffContext
+} from "./data/sessionHandoffContexts";
 
 type AgentSessionSummary = {
   provider: "codex" | "claude" | string;
@@ -34,6 +34,7 @@ type AgentSessionSummary = {
   filePath: string;
   messageCount: number;
   lastUserMessage: string | null;
+  classificationMetadata?: SessionClassificationMetadata | null;
 };
 
 type AgentSessionMessage = {
@@ -46,7 +47,19 @@ type AgentSessionDetail = {
   summary: AgentSessionSummary;
   messages: AgentSessionMessage[];
   distilledMarkdown: string;
+  classificationMetadata: SessionClassificationMetadata;
 };
+
+type WorkContextCategory =
+  | "implementation"
+  | "debugging"
+  | "review"
+  | "planning"
+  | "refactor"
+  | "research"
+  | "verification"
+  | "launch"
+  | "general";
 
 type LoadState =
   | { state: "idle" }
@@ -65,6 +78,27 @@ type ActionState =
   | { state: "running"; message: string }
   | { state: "success"; message: string }
   | { state: "error"; message: string };
+
+type ResolvedLaunchContextPayload = {
+  fragment: CoreContextFragment;
+  handoff: SessionHandoffContext;
+  handoffMarkdown: string;
+  contextFilePath: string;
+  launchTarget: string;
+  injectionMethod: string;
+};
+
+type LaunchFlowState =
+  | {
+      state: "empty";
+      selectedHandoffId: null;
+      resolvedContextPayload: null;
+    }
+  | {
+      state: "ready";
+      selectedHandoffId: string;
+      resolvedContextPayload: ResolvedLaunchContextPayload;
+    };
 
 declare global {
   interface Window {
@@ -114,10 +148,6 @@ function isSessionContext(context: CoreContextFragment) {
   );
 }
 
-function sanitizeFileName(value: string) {
-  return value.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 120);
-}
-
 function formatProvider(provider: string) {
   if (provider === "codex") {
     return "Codex";
@@ -130,28 +160,168 @@ function formatProvider(provider: string) {
   return provider;
 }
 
+function formatWorkContextCategory(category: string) {
+  const labels: Record<string, string> = {
+    implementation: "구현",
+    debugging: "디버깅",
+    review: "리뷰",
+    planning: "계획",
+    refactor: "리팩터",
+    research: "리서치",
+    verification: "검증",
+    launch: "실행",
+    general: "일반"
+  };
+
+  return labels[category] ?? category;
+}
+
+function formatClassificationStatus(status: SessionClassificationStatus) {
+  const labels: Record<SessionClassificationStatus, string> = {
+    pending: "대기",
+    classified: "분류됨",
+    reviewed: "검토됨",
+    modified: "수정됨"
+  };
+
+  return labels[status];
+}
+
+function formatBoolean(value: boolean) {
+  return value ? "true" : "false";
+}
+
+function formatNullable(value: string | null | undefined) {
+  return value && value.trim() ? value : "없음";
+}
+
+function formatListValue(values: string[]) {
+  return values.length > 0 ? values.join(", ") : "없음";
+}
+
+function formatInjectionMethod(method: string) {
+  const labels: Record<string, string> = {
+    "append-system-prompt-file": "Claude temporary prompt file",
+    "agents-md-section-marker-merge": "Codex AGENTS.md managed block"
+  };
+
+  return labels[method] ?? method;
+}
+
+function formatLaunchSelectLabel(context: SavedSessionHandoffContext) {
+  return `Launch ${formatProvider(context.handoff.launch_target)} 선택`;
+}
+
+function buildResolvedLaunchContextPayload(
+  context: SavedSessionHandoffContext
+): ResolvedLaunchContextPayload {
+  return {
+    fragment: context.fragment,
+    handoff: context.handoff,
+    handoffMarkdown: context.handoff.handoff_markdown,
+    contextFilePath: context.fragment.file_path,
+    launchTarget: context.handoff.launch_target,
+    injectionMethod: context.handoff.injection_method
+  };
+}
+
+const WORK_CONTEXT_CATEGORIES: WorkContextCategory[] = [
+  "implementation",
+  "debugging",
+  "review",
+  "planning",
+  "refactor",
+  "research",
+  "verification",
+  "launch",
+  "general"
+];
+
+const CLASSIFICATION_STATUSES: SessionClassificationStatus[] = [
+  "classified",
+  "reviewed",
+  "modified",
+  "pending"
+];
+
+function sessionHasCategory(session: AgentSessionSummary, category: WorkContextCategory) {
+  const metadata = session.classificationMetadata;
+  if (!metadata) {
+    return false;
+  }
+
+  return (
+    metadata.workContextCategory === category ||
+    metadata.workContextCategories.includes(category)
+  );
+}
+
 export function App() {
   const [sessions, setSessions] = useState<AgentSessionSummary[]>([]);
-  const [savedContexts, setSavedContexts] = useState<CoreContextFragment[]>([]);
+  const [savedContexts, setSavedContexts] = useState<SavedSessionHandoffContext[]>([]);
+  const [selectedSavedContext, setSelectedSavedContext] = useState<SavedSessionHandoffContext | null>(null);
   const [activeSessionId, setActiveSessionId] = useState("");
   const [searchTerm, setSearchTerm] = useState("");
   const [providerFilter, setProviderFilter] = useState<"all" | "codex" | "claude">("all");
+  const [categoryFilter, setCategoryFilter] = useState<"all" | WorkContextCategory>("all");
+  const [statusFilter, setStatusFilter] = useState<"all" | SessionClassificationStatus>("all");
   const [sessionLoadState, setSessionLoadState] = useState<LoadState>({ state: "idle" });
   const [contextLoadState, setContextLoadState] = useState<LoadState>({ state: "idle" });
   const [detailState, setDetailState] = useState<SessionDetailState>({ state: "idle" });
   const [draftContent, setDraftContent] = useState("");
   const [saveState, setSaveState] = useState<ActionState>({ state: "idle" });
   const [copyState, setCopyState] = useState<ActionState>({ state: "idle" });
+  const [selectionState, setSelectionState] = useState<ActionState>({ state: "idle" });
+  const [launchFlowState, setLaunchFlowState] = useState<LaunchFlowState>({
+    state: "empty",
+    selectedHandoffId: null,
+    resolvedContextPayload: null
+  });
+  const [refineState, setRefineState] = useState<ActionState>({ state: "idle" });
+  const [refinerTarget, setRefinerTarget] = useState<"claude" | "codex">("claude");
 
   useEffect(() => {
     void refreshSessions();
     void refreshSavedContexts();
   }, []);
 
+  useEffect(() => {
+    if (!selectedSavedContext) {
+      setSelectionState({ state: "idle" });
+      setLaunchFlowState({
+        state: "empty",
+        selectedHandoffId: null,
+        resolvedContextPayload: null
+      });
+      return;
+    }
+
+    setLaunchFlowState({
+      state: "ready",
+      selectedHandoffId: selectedSavedContext.fragment.context_id,
+      resolvedContextPayload: buildResolvedLaunchContextPayload(selectedSavedContext)
+    });
+    setSelectionState({
+      state: "success",
+      message: `${selectedSavedContext.handoff.title}이(가) 새 세션 실행 대상으로 선택되었습니다.`
+    });
+  }, [selectedSavedContext]);
+
   const filteredSessions = useMemo(() => {
     const normalized = searchTerm.trim().toLowerCase();
     return sessions.filter((session) => {
       if (providerFilter !== "all" && session.provider !== providerFilter) {
+        return false;
+      }
+
+      if (categoryFilter !== "all" && !sessionHasCategory(session, categoryFilter)) {
+        return false;
+      }
+
+      if (
+        statusFilter !== "all" &&
+        session.classificationMetadata?.workContextClassificationStatus !== statusFilter
+      ) {
         return false;
       }
 
@@ -165,16 +335,18 @@ export function App() {
         session.sessionId,
         session.cwd ?? "",
         session.filePath,
-        session.lastUserMessage ?? ""
+        session.lastUserMessage ?? "",
+        session.classificationMetadata?.workContextCategory ?? "",
+        ...(session.classificationMetadata?.workContextCategories ?? [])
       ]
         .join(" ")
         .toLowerCase()
         .includes(normalized);
     });
-  }, [providerFilter, searchTerm, sessions]);
+  }, [categoryFilter, providerFilter, searchTerm, sessions, statusFilter]);
 
   const activeSession =
-    sessions.find((session) => session.sessionId === activeSessionId) ?? sessions[0];
+    filteredSessions.find((session) => session.sessionId === activeSessionId) ?? filteredSessions[0];
 
   useEffect(() => {
     if (!activeSession) {
@@ -187,6 +359,7 @@ export function App() {
     setDetailState({ state: "loading", session: activeSession });
     setSaveState({ state: "idle" });
     setCopyState({ state: "idle" });
+    setRefineState({ state: "idle" });
 
     invokeDesktop<AgentSessionDetail>("read_agent_session", {
       request: {
@@ -246,17 +419,26 @@ export function App() {
     setContextLoadState({ state: "loading" });
 
     try {
-      const contexts = await invokeDesktop<CoreContextFragment[]>("discover_markdown_contexts", {
-        request: null
-      });
-      const sessionContexts = contexts.filter(isSessionContext);
+      const sessionContexts = await listSavedSessionHandoffContexts(invokeDesktop);
       setSavedContexts(sessionContexts);
+      setSelectedSavedContext((current) => {
+        if (!current) {
+          return sessionContexts[0] ?? null;
+        }
+
+        return (
+          sessionContexts.find(
+            (context) => context.fragment.context_id === current.fragment.context_id
+          ) ?? sessionContexts[0] ?? null
+        );
+      });
       setContextLoadState({
         state: "success",
         message: `${sessionContexts.length}개의 저장된 세션 컨텍스트가 있습니다.`
       });
     } catch (error: unknown) {
       setSavedContexts([]);
+      setSelectedSavedContext(null);
       setContextLoadState({ state: "error", message: formatError(error) });
     }
   }
@@ -276,25 +458,72 @@ export function App() {
     }
   }
 
-  async function copySavedContext(context: CoreContextFragment) {
+  async function refineDraft() {
+    if (detailState.state !== "ready" || !draftContent.trim()) {
+      return;
+    }
+
+    setRefineState({ state: "running", message: "AI가 핵심 맥락을 정리하는 중" });
+    setSaveState({ state: "idle" });
+
+    try {
+      const refined = await invokeDesktop<string>("refine_session_context", {
+        request: {
+          draftContent,
+          targetCli: refinerTarget
+        }
+      });
+      setDraftContent(refined);
+      await persistSessionDraft(refined);
+      setRefineState({
+        state: "success",
+        message: "목표, 변경사항, 검증, 남은 작업 중심으로 정리하고 저장했습니다."
+      });
+    } catch (error: unknown) {
+      setSaveState({ state: "error", message: `저장하지 않았습니다: ${formatError(error)}` });
+      setRefineState({ state: "error", message: formatError(error) });
+    }
+  }
+
+  async function copySavedContext(context: SavedSessionHandoffContext) {
     setCopyState({ state: "running", message: "복사 중" });
 
     try {
-      await navigator.clipboard.writeText(context.content);
+      await navigator.clipboard.writeText(context.handoff.handoff_markdown);
       setCopyState({ state: "success", message: "저장된 세션 컨텍스트를 복사했습니다." });
     } catch (error: unknown) {
       setCopyState({ state: "error", message: formatError(error) });
     }
   }
 
-  function openSavedContext(context: CoreContextFragment) {
-    setDraftContent(context.content);
+  function selectSavedContextForDownstreamUse(context: SavedSessionHandoffContext) {
+    setSelectedSavedContext(context);
+    setSelectionState({
+      state: "success",
+      message: `${context.handoff.title}이(가) 새 세션 실행 대상으로 선택되었습니다.`
+    });
+  }
+
+  async function openSavedContext(context: SavedSessionHandoffContext) {
+    selectSavedContextForDownstreamUse(context);
     setDetailState({ state: "idle" });
     setSaveState({ state: "idle" });
-    setCopyState({
-      state: "success",
-      message: `${context.title}을(를) 편집 초안으로 열었습니다.`
-    });
+
+    try {
+      const detail = await openSavedSessionHandoffContext(invokeDesktop, context.fragment.file_path);
+      selectSavedContextForDownstreamUse(detail);
+      setDraftContent(detail.handoff.handoff_markdown);
+      setCopyState({
+        state: "success",
+        message: `${detail.handoff.title}을(를) 편집 초안으로 열었습니다.`
+      });
+    } catch (error: unknown) {
+      setDraftContent(context.handoff.handoff_markdown);
+      setCopyState({
+        state: "error",
+        message: formatError(error)
+      });
+    }
   }
 
   async function saveDraftContext() {
@@ -302,29 +531,33 @@ export function App() {
       return;
     }
 
-    const summary = detailState.detail.summary;
     setSaveState({ state: "running", message: "저장 중" });
 
     try {
-      const fileName = `${sanitizeFileName(summary.provider)}-${sanitizeFileName(
-        summary.sessionId
-      )}.md`;
-      await invokeDesktop<CoreContextFragment>("create_markdown_context", {
-        request: {
-          fileName,
-          folderPath: "session-history",
-          vaultScope: "local",
-          content: draftContent
-        }
-      });
-      setSaveState({
-        state: "success",
-        message: "이전 세션을 다음 작업용 컨텍스트로 저장했습니다."
-      });
-      await refreshSavedContexts();
+      await persistSessionDraft(draftContent);
     } catch (error: unknown) {
-      setSaveState({ state: "error", message: formatError(error) });
+      setSaveState({ state: "error", message: `저장하지 않았습니다: ${formatError(error)}` });
     }
+  }
+
+  async function persistSessionDraft(content: string) {
+    if (detailState.state !== "ready") {
+      throw new Error("저장할 이전 세션이 선택되지 않았습니다.");
+    }
+
+    const summary = detailState.detail.summary;
+    setSaveState({ state: "running", message: "검증 후 저장 중" });
+
+    await saveAgentSessionHandoffContext(invokeDesktop, {
+      provider: summary.provider,
+      filePath: summary.filePath,
+      content
+    });
+    setSaveState({
+      state: "success",
+      message: "검증된 세션 컨텍스트를 저장했습니다."
+    });
+    await refreshSavedContexts();
   }
 
   const stats = {
@@ -402,6 +635,36 @@ export function App() {
               </button>
             ))}
           </div>
+          <div className="classification-filter-grid" aria-label="세션 분류 필터">
+            <label>
+              <span>작업 유형</span>
+              <select
+                value={categoryFilter}
+                onChange={(event) => setCategoryFilter(event.target.value as "all" | WorkContextCategory)}
+              >
+                <option value="all">전체</option>
+                {WORK_CONTEXT_CATEGORIES.map((category) => (
+                  <option value={category} key={category}>
+                    {formatWorkContextCategory(category)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>분류 상태</span>
+              <select
+                value={statusFilter}
+                onChange={(event) => setStatusFilter(event.target.value as "all" | SessionClassificationStatus)}
+              >
+                <option value="all">전체</option>
+                {CLASSIFICATION_STATUSES.map((status) => (
+                  <option value={status} key={status}>
+                    {formatClassificationStatus(status)}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
           <StatusLine state={sessionLoadState} />
           {activeSession ? <ActiveSessionCard session={activeSession} /> : null}
           <div className="session-list">
@@ -417,6 +680,7 @@ export function App() {
                   <strong>{session.title}</strong>
                   <small>{session.cwd ?? session.filePath}</small>
                   {session.lastUserMessage ? <small>{session.lastUserMessage}</small> : null}
+                  <SessionRowClassification metadata={session.classificationMetadata ?? null} />
                 </span>
                 <em>{formatProvider(session.provider)}</em>
               </button>
@@ -435,6 +699,16 @@ export function App() {
             </div>
           </div>
           <SessionDraftHeader detailState={detailState} />
+          <div className="draft-stage-card">
+            <div>
+              <strong>1단계: 빠른 추출</strong>
+              <p>세션 로그에서 사용자/어시스턴트 메시지를 로컬에서 즉시 가져옵니다.</p>
+            </div>
+            <div>
+              <strong>2단계: AI 핵심 정리</strong>
+              <p>원하면 로컬 Claude/Codex CLI로 목표, 결정, 변경 파일, 검증, 남은 작업만 압축합니다.</p>
+            </div>
+          </div>
           <textarea
             className="markdown-editor session-context-draft"
             aria-label="새 세션에 넣을 컨텍스트 초안"
@@ -447,11 +721,36 @@ export function App() {
           <div className="session-action-bar">
             <ActionFeedback state={copyState} />
             <ActionFeedback state={saveState} />
+            <ActionFeedback state={refineState} />
             <div className="session-action-buttons">
+              <label className="refiner-select">
+                <span>정리 엔진</span>
+                <select
+                  value={refinerTarget}
+                  disabled={refineState.state === "running"}
+                  onChange={(event) => setRefinerTarget(event.target.value as "claude" | "codex")}
+                >
+                  <option value="claude">Claude</option>
+                  <option value="codex">Codex</option>
+                </select>
+              </label>
               <button
                 type="button"
                 className="secondary-button"
-                disabled={!draftContent.trim() || copyState.state === "running"}
+                disabled={
+                  detailState.state !== "ready" ||
+                  !draftContent.trim() ||
+                  refineState.state === "running"
+                }
+                onClick={() => void refineDraft()}
+              >
+                <Sparkles aria-hidden="true" />
+                AI로 핵심 정리
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                disabled={!draftContent.trim() || copyState.state === "running" || refineState.state === "running"}
                 onClick={() => void copyDraft()}
               >
                 <Clipboard aria-hidden="true" />
@@ -462,7 +761,8 @@ export function App() {
                 disabled={
                   detailState.state !== "ready" ||
                   !draftContent.trim() ||
-                  saveState.state === "running"
+                  saveState.state === "running" ||
+                  refineState.state === "running"
                 }
                 onClick={() => void saveDraftContext()}
               >
@@ -486,25 +786,88 @@ export function App() {
           </button>
         </div>
         <StatusLine state={contextLoadState} />
-        <div className="saved-context-list">
+        <ActionFeedback state={selectionState} />
+        <div
+          className="saved-context-list"
+          role="listbox"
+          aria-label="저장된 세션 컨텍스트 선택 목록"
+          aria-activedescendant={
+            selectedSavedContext ? `saved-context-${selectedSavedContext.fragment.context_id}` : undefined
+          }
+        >
           {savedContexts.map((context) => (
-            <article className="saved-context-row" key={context.context_id}>
-              <div>
-                <strong>{context.title}</strong>
-                <small>{context.file_path}</small>
+            <article
+              aria-selected={selectedSavedContext?.fragment.context_id === context.fragment.context_id}
+              className={
+                selectedSavedContext?.fragment.context_id === context.fragment.context_id
+                  ? "saved-context-row active"
+                  : "saved-context-row"
+              }
+              id={`saved-context-${context.fragment.context_id}`}
+              key={context.fragment.context_id}
+              role="option"
+              tabIndex={0}
+              onClick={() => selectSavedContextForDownstreamUse(context)}
+              onKeyDown={(event) => {
+                if (event.target !== event.currentTarget) {
+                  return;
+                }
+
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  selectSavedContextForDownstreamUse(context);
+                }
+              }}
+            >
+              <div className="saved-context-summary">
+                <strong>{context.handoff.title}</strong>
+                <small>{context.fragment.file_path}</small>
+                <div className="saved-context-launch-summary" aria-label="실행 주입 방식">
+                  <span>{formatProvider(context.handoff.launch_target)}</span>
+                  <small>{formatInjectionMethod(context.handoff.injection_method)}</small>
+                </div>
+                <SavedHandoffMetadataGrid handoff={context.handoff} compact={true} />
+                <SavedHandoffDistilledGrid handoff={context.handoff} compact={true} />
               </div>
               <div className="saved-context-actions">
-                <em>{context.vault_scope}</em>
+                <em>{context.fragment.vault_scope}</em>
+                <button
+                  type="button"
+                  className="launch-select-button"
+                  aria-pressed={selectedSavedContext?.fragment.context_id === context.fragment.context_id}
+                  aria-label={`${context.handoff.title}을(를) ${formatProvider(
+                    context.handoff.launch_target
+                  )} 새 세션 실행 대상으로 선택`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    selectSavedContextForDownstreamUse(context);
+                  }}
+                >
+                  {selectedSavedContext?.fragment.context_id === context.fragment.context_id ? (
+                    <CheckCircle2 aria-hidden="true" />
+                  ) : (
+                    <Rocket aria-hidden="true" />
+                  )}
+                  {selectedSavedContext?.fragment.context_id === context.fragment.context_id
+                    ? "실행 대상으로 선택됨"
+                    : formatLaunchSelectLabel(context)}
+                </button>
                 <button
                   type="button"
                   className="secondary-button"
-                  onClick={() => openSavedContext(context)}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void openSavedContext(context);
+                  }}
                 >
                   초안으로 열기
                 </button>
                 <button
                   type="button"
-                  onClick={() => void copySavedContext(context)}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void copySavedContext(context);
+                  }}
                 >
                   <Clipboard aria-hidden="true" />
                   복사
@@ -518,8 +881,68 @@ export function App() {
             </p>
           ) : null}
         </div>
+        {selectedSavedContext ? (
+          <>
+            <SelectedSavedContextForUse
+              context={selectedSavedContext}
+              launchFlowState={launchFlowState}
+            />
+            <SavedSessionDetail context={selectedSavedContext} />
+          </>
+        ) : null}
       </section>
     </main>
+  );
+}
+
+function SelectedSavedContextForUse({
+  context,
+  launchFlowState
+}: {
+  context: SavedSessionHandoffContext;
+  launchFlowState: LaunchFlowState;
+}) {
+  const handoff = context.handoff;
+  const payload =
+    launchFlowState.state === "ready" &&
+    launchFlowState.selectedHandoffId === context.fragment.context_id
+      ? launchFlowState.resolvedContextPayload
+      : null;
+
+  return (
+    <article className="selected-saved-context" aria-label="다운스트림 사용 대상으로 선택된 세션 컨텍스트">
+      <div>
+        <p className="eyebrow">Selected for downstream use</p>
+        <h3>{handoff.title}</h3>
+        <small>{context.fragment.file_path}</small>
+      </div>
+      <dl>
+        <div>
+          <dt>Selected handoff ID</dt>
+          <dd>{launchFlowState.selectedHandoffId ?? "없음"}</dd>
+        </div>
+        <div>
+          <dt>Launch target</dt>
+          <dd>{formatProvider(payload?.launchTarget ?? handoff.launch_target)}</dd>
+        </div>
+        <div>
+          <dt>Injection method</dt>
+          <dd>{formatInjectionMethod(payload?.injectionMethod ?? handoff.injection_method)}</dd>
+        </div>
+        <div>
+          <dt>Source session</dt>
+          <dd>{payload?.handoff.source_session_ref ?? handoff.source_session_ref}</dd>
+        </div>
+        <div>
+          <dt>Payload file</dt>
+          <dd>{payload?.contextFilePath ?? context.fragment.file_path}</dd>
+        </div>
+        <div>
+          <dt>Handoff markdown</dt>
+          <dd>{(payload?.handoffMarkdown ?? handoff.handoff_markdown).trim() ? "준비됨" : "비어 있음"}</dd>
+        </div>
+      </dl>
+    </article>
   );
 }
 
@@ -561,8 +984,29 @@ function ActiveSessionCard({ session }: { session: AgentSessionSummary }) {
           <dd>{session.messageCount}개</dd>
         </div>
       </dl>
+      {session.classificationMetadata ? (
+        <SessionClassificationSummary metadata={session.classificationMetadata} compact={true} />
+      ) : null}
       {session.lastUserMessage ? <p>{session.lastUserMessage}</p> : null}
     </article>
+  );
+}
+
+function SessionRowClassification({
+  metadata
+}: {
+  metadata: SessionClassificationMetadata | null;
+}) {
+  if (!metadata) {
+    return <small className="session-row-classification pending">분류 정보 없음</small>;
+  }
+
+  return (
+    <small className="session-row-classification">
+      {formatWorkContextCategory(metadata.workContextCategory)} ·{" "}
+      {formatClassificationStatus(metadata.workContextClassificationStatus)} ·{" "}
+      {metadata.workContextConfidenceScore}%
+    </small>
   );
 }
 
@@ -621,17 +1065,188 @@ function SessionDraftHeader({ detailState }: { detailState: SessionDetailState }
   }
 
   return (
-    <div className="session-detail-meta">
-      <span>
-        <MessageSquareText aria-hidden="true" />
-        {formatProvider(detailState.detail.summary.provider)}
-      </span>
-      <span>
-        <Clock3 aria-hidden="true" />
-        {detailState.detail.summary.messageCount}개 메시지
-      </span>
-      {detailState.detail.summary.cwd ? <span>{detailState.detail.summary.cwd}</span> : null}
+    <div className="session-detail-block">
+      <div className="session-detail-meta">
+        <span>
+          <MessageSquareText aria-hidden="true" />
+          {formatProvider(detailState.detail.summary.provider)}
+        </span>
+        <span>
+          <Clock3 aria-hidden="true" />
+          {detailState.detail.summary.messageCount}개 메시지
+        </span>
+        {detailState.detail.summary.cwd ? <span>{detailState.detail.summary.cwd}</span> : null}
+      </div>
+      <SessionClassificationSummary metadata={detailState.detail.classificationMetadata} />
     </div>
+  );
+}
+
+function SessionClassificationSummary({
+  metadata,
+  compact = false
+}: {
+  metadata: SessionClassificationMetadata;
+  compact?: boolean;
+}) {
+  const categories =
+    metadata.workContextCategories.length > 0
+      ? metadata.workContextCategories
+      : [metadata.workContextCategory];
+
+  return (
+    <div className={compact ? "session-classification compact" : "session-classification"}>
+      <div className="session-classification-chips" aria-label="세션 분류 메타데이터">
+        <span>{formatWorkContextCategory(metadata.workContextCategory)}</span>
+        <span>{formatClassificationStatus(metadata.workContextClassificationStatus)}</span>
+        <span>{metadata.workContextConfidenceScore}%</span>
+        <span>{formatProvider(metadata.sourceTool)}</span>
+      </div>
+      {!compact ? (
+        <>
+          <p>{metadata.workContextRationale}</p>
+          <small>
+            범주: {categories.map(formatWorkContextCategory).join(", ")}
+            {metadata.distillationFocus.length > 0
+              ? ` · 정리 초점: ${metadata.distillationFocus.join(", ")}`
+              : ""}
+          </small>
+        </>
+      ) : (
+        <small>
+          {formatWorkContextCategory(metadata.workContextCategory)} ·{" "}
+          {formatClassificationStatus(metadata.workContextClassificationStatus)} ·{" "}
+          {metadata.workContextConfidenceScore}%
+        </small>
+      )}
+    </div>
+  );
+}
+
+function SavedHandoffMetadataGrid({
+  handoff,
+  compact = false
+}: {
+  handoff: SessionHandoffContext;
+  compact?: boolean;
+}) {
+  const metadataRows = [
+    ["Source tool", formatProvider(handoff.source_tool)],
+    ["Source session", handoff.source_session_ref],
+    ["Working directory", formatNullable(handoff.source_working_directory)],
+    ["Source log", formatNullable(handoff.source_log_path)],
+    ["Source updated", formatNullable(handoff.source_updated_at)],
+    ["Created", formatNullable(handoff.created_at)],
+    ["Category", formatWorkContextCategory(handoff.category)],
+    ["Categories", formatListValue(handoff.categories.map(formatWorkContextCategory))],
+    ["Status", formatClassificationStatus(handoff.classification_status)],
+    ["Confidence", `${handoff.classification_confidence_score}%`],
+    ["Launch target", formatProvider(handoff.launch_target)],
+    ["Injection", formatInjectionMethod(handoff.injection_method)],
+    ["Cleanup applied", formatBoolean(handoff.cleanup_applied)],
+    ["Refine mode", handoff.refine_mode],
+    ["Tags", formatListValue(handoff.tags)]
+  ];
+
+  return (
+    <dl className={compact ? "saved-handoff-grid compact" : "saved-handoff-grid"}>
+      {metadataRows.map(([label, value]) => (
+        <div key={label}>
+          <dt>{label}</dt>
+          <dd>{value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function SavedHandoffDistilledGrid({
+  handoff,
+  compact = false
+}: {
+  handoff: SessionHandoffContext;
+  compact?: boolean;
+}) {
+  const rows = [
+    ["Summary", formatNullable(handoff.summary)],
+    ["Goals", formatListValue(handoff.goals)],
+    ["Key changed files", formatListValue(handoff.key_changed_files)],
+    ["Commands", formatListValue(handoff.commands)],
+    ["Decisions", formatListValue(handoff.decisions)],
+    ["Verification results", formatListValue(handoff.verification_results)],
+    ["Remaining work", formatListValue(handoff.remaining_work)]
+  ];
+
+  return (
+    <dl className={compact ? "saved-handoff-distilled compact" : "saved-handoff-distilled"}>
+      {rows.map(([label, value]) => (
+        <div key={label}>
+          <dt>{label}</dt>
+          <dd>{value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function SavedHandoffFieldList({
+  title,
+  values
+}: {
+  title: string;
+  values: string[];
+}) {
+  return (
+    <section className="saved-handoff-field">
+      <h4>{title}</h4>
+      {values.length > 0 ? (
+        <ul>
+          {values.map((value, index) => (
+            <li key={`${title}:${index}`}>{value}</li>
+          ))}
+        </ul>
+      ) : (
+        <p>없음</p>
+      )}
+    </section>
+  );
+}
+
+function SavedSessionDetail({ context }: { context: SavedSessionHandoffContext }) {
+  const handoff = context.handoff;
+
+  return (
+    <article className="saved-session-detail" aria-label="저장된 세션 컨텍스트 상세">
+      <div className="saved-session-detail-heading">
+        <div>
+          <p className="eyebrow">Saved handoff detail</p>
+          <h3>{handoff.title}</h3>
+        </div>
+        <em>{context.fragment.vault_scope}</em>
+      </div>
+      <SavedHandoffMetadataGrid handoff={handoff} />
+      <SavedHandoffDistilledGrid handoff={handoff} />
+      <section className="saved-handoff-rationale">
+        <h4>Classification rationale</h4>
+        <p>{formatNullable(handoff.classification_rationale)}</p>
+      </section>
+      <section className="saved-handoff-rationale">
+        <h4>Summary</h4>
+        <p>{formatNullable(handoff.summary)}</p>
+      </section>
+      <div className="saved-handoff-fields">
+        <SavedHandoffFieldList title="Goals" values={handoff.goals} />
+        <SavedHandoffFieldList title="Key changed files" values={handoff.key_changed_files} />
+        <SavedHandoffFieldList title="Commands" values={handoff.commands} />
+        <SavedHandoffFieldList title="Decisions" values={handoff.decisions} />
+        <SavedHandoffFieldList title="Verification results" values={handoff.verification_results} />
+        <SavedHandoffFieldList title="Remaining work" values={handoff.remaining_work} />
+      </div>
+      <section className="saved-handoff-markdown">
+        <h4>Handoff markdown</h4>
+        <pre>{handoff.handoff_markdown || "없음"}</pre>
+      </section>
+    </article>
   );
 }
 

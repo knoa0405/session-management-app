@@ -87,6 +87,25 @@ pub struct ContextFragment {
     #[serde(default)]
     pub import_source_type: Option<ImportSourceType>,
     pub llm_classification_status: ClassificationStatus,
+    #[serde(default)]
+    pub session_handoff_classification: Option<SessionHandoffClassificationMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionHandoffClassificationMetadata {
+    pub source_tool: String,
+    pub source_session_ref: String,
+    pub source_working_directory: String,
+    pub source_log_path: String,
+    pub work_context_category: String,
+    #[serde(default)]
+    pub work_context_categories: Vec<String>,
+    pub work_context_classification_status: ClassificationStatus,
+    pub work_context_confidence_score: u8,
+    pub work_context_rationale: String,
+    #[serde(default)]
+    pub distillation_focus: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -336,6 +355,7 @@ mod tests {
         assert_eq!(context.classification, Classification::Shared);
         assert_eq!(context.inferred_classification, None);
         assert_eq!(context.import_source_type, None);
+        assert_eq!(context.session_handoff_classification, None);
     }
 
     #[test]
@@ -356,6 +376,7 @@ mod tests {
             import_source: None,
             import_source_type: None,
             llm_classification_status: ClassificationStatus::Classified,
+            session_handoff_classification: None,
         };
 
         let value = serde_json::to_value(context).expect("context should serialize");

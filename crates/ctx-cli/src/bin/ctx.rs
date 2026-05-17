@@ -1,22 +1,27 @@
 use ctx_core::{
     app_status, assemble_claude_prompt_file, assemble_subagent_context_output,
-    classify_import_markdown_content, cleanup_codex_agents_md,
+    classify_import_markdown_content, classify_work_context_detail, cleanup_codex_agents_md,
     cleanup_residual_codex_agents_md_markers, cleanup_stale_wrapper_state,
-    create_context_file, default_wrapper_state_dir, discover_existing_context_file_results,
-    initialize_global_vault, initialize_project_local_vault, inject_codex_agents_md,
-    list_context_files_with_discovered, load_preset_from_resolved_overlay,
-    lookup_markdown_context_index, lookup_markdown_contexts_by_tag,
-    materialize_discovered_context_files, new_empty_preset, reindex_markdown_contexts,
-    remove_transient_wrapper_state_file,
-    replace_agents_md_managed_section, resolve_overlay_vault, resolve_subagent_context_items,
-    snapshot_context_directories, watch_context_directories, write_transient_wrapper_state,
-    Classification, ClassificationStatus, CliTarget, CodexAgentsMdInjection, ContextFileSnapshot,
-    ContextFragment, ImportTimeClassificationRequest, Preset, PresetLoadError,
-    ResolvedContextItem, SubagentManifest, TransientWrapperState, VaultScope, AGENTS_MD_FILE_NAME,
+    create_session_handoff_context_file, default_wrapper_state_dir,
+    discover_existing_context_file_results, filter_work_relevant_content, initialize_global_vault,
+    initialize_project_local_vault, inject_codex_agents_md, list_context_files_with_discovered,
+    load_preset_from_resolved_overlay, lookup_markdown_context_index,
+    lookup_markdown_contexts_by_tag, materialize_discovered_context_files, new_empty_preset,
+    parse_claude_session_log_detail, parse_codex_session_log_detail,
+    read_resolved_session_handoff_context, reindex_markdown_contexts,
+    remove_transient_wrapper_state_file, replace_agents_md_managed_section,
+    resolve_claude_session_log_roots, resolve_codex_session_log_roots, resolve_overlay_vault,
+    resolve_subagent_context_items, snapshot_context_directories, watch_context_directories,
+    write_transient_wrapper_state, Classification, ClaudeSessionLogScanner, CliTarget,
+    CodexAgentsMdInjection, CodexSessionLogScanner, ContextFileSnapshot, ContextFragment,
+    ImportTimeClassificationRequest, Preset, PresetContextComposition, PresetContextSelection,
+    PresetLoadError, ResolvedContextItem, SessionHandoffClassificationMetadata,
+    SessionHandoffContext, SessionLogDetail as AgentSessionDetail,
+    SessionLogMetadata as AgentSessionSummary, SessionLogProvider, SessionLogScanRequest,
+    SessionLogScanner, SubagentManifest, TransientWrapperState, VaultScope, WorkContextCategory,
+    WorkContextClassificationResult, WorkContextRefineMode, WorkContextSignalSet,
 };
-use serde_json::Value;
 use std::{
-    collections::HashMap,
     env,
     ffi::OsString,
     fs,
@@ -24,7 +29,7 @@ use std::{
     path::{Path, PathBuf},
     process::{self, Child, Command, ExitStatus, Stdio},
     sync::mpsc,
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
@@ -76,12 +81,18 @@ fn main() {
             eprintln!("{message}");
             process::exit(1);
         }),
+        Some("saved") => list_saved_session_contexts().unwrap_or_else(|message| {
+            eprintln!("{message}");
+            process::exit(1);
+        }),
         Some("context") => context_command(args.collect()).unwrap_or_else(|message| {
             eprintln!("{message}");
             process::exit(1);
         }),
         Some("import") | Some("reindex") | Some("lookup") | Some("watch") => {
-            eprintln!("markdown context commands moved under 'ctx context'. Run 'ctx context --help'.");
+            eprintln!(
+                "markdown context commands moved under 'ctx context'. Run 'ctx context --help'."
+            );
             process::exit(2);
         }
         Some("-h") | Some("--help") | None => print_help(),
@@ -121,6 +132,7 @@ struct CodexLaunchPlan {
 struct LaunchArgs {
     preset_ref: Option<String>,
     session_ref: Option<String>,
+    handoff_ref: Option<String>,
     passthrough_args: Vec<String>,
 }
 
@@ -221,24 +233,74 @@ fn orchestrate_wrapper_startup(
 ) -> Result<WrapperStartupOrchestration, String> {
     cleanup_stale_state_before_launch();
     let loaded = load_launch_preset(target, working_dir, launch_args.preset_ref)?;
-    let session_context = match launch_args.session_ref {
-        Some(session_ref) => Some(resolve_session_context_fragment(&session_ref)?),
-        None => None,
+    if launch_args.session_ref.is_some() && launch_args.handoff_ref.is_some() {
+        return Err("--session and --handoff cannot be supplied together".to_string());
+    }
+
+    let selected_context = match (launch_args.session_ref, launch_args.handoff_ref) {
+        (Some(session_ref), None) => Some(resolve_session_context_fragment(&session_ref)?),
+        (None, Some(handoff_ref)) => Some(resolve_saved_handoff_context_fragment(
+            working_dir,
+            &handoff_ref,
+        )?),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("checked above"),
     };
+    let mut preset = loaded.preset;
     let mut contexts = loaded.contexts;
-    if let Some(session_context) = session_context {
-        contexts.insert(0, session_context);
+    if let Some(selected_context) = selected_context {
+        prepend_session_context_to_launch_selection(&mut preset, &selected_context);
+        contexts.insert(0, selected_context);
     }
     let passthrough_args =
         merge_launch_passthrough_args(loaded.passthrough_args, launch_args.passthrough_args);
-    let embedded_manifest = resolve_embedded_launch_manifest(&loaded.preset, &contexts)?;
+    let embedded_manifest = resolve_embedded_launch_manifest(&preset, &contexts)?;
 
     Ok(WrapperStartupOrchestration {
-        preset: loaded.preset,
+        preset,
         contexts,
         passthrough_args,
         embedded_manifest,
     })
+}
+
+fn prepend_session_context_to_launch_selection(preset: &mut Preset, context: &ContextFragment) {
+    preset
+        .preset_contexts
+        .retain(|context_id| context_id != &context.context_id);
+    preset.preset_contexts.insert(0, context.context_id);
+
+    if preset.preset_context_composition.is_empty() {
+        return;
+    }
+
+    for composition in &mut preset.preset_context_composition {
+        composition.order = composition.order.saturating_add(1);
+    }
+
+    let source_ref = context
+        .session_handoff_classification
+        .as_ref()
+        .map(|metadata| {
+            format!(
+                "session:{}:{}",
+                metadata.source_tool, metadata.source_session_ref
+            )
+        })
+        .unwrap_or_else(|| format!("session:{}", context.context_id));
+
+    preset
+        .preset_context_composition
+        .retain(|composition| composition.context_id != context.context_id);
+    preset
+        .preset_context_composition
+        .push(PresetContextComposition {
+            context_id: context.context_id,
+            order: 0,
+            source_ref,
+            required: true,
+            selection: PresetContextSelection::default(),
+        });
 }
 
 fn load_launch_preset(
@@ -350,7 +412,11 @@ fn build_claude_launch_plan(
 ) -> Result<ClaudeLaunchPlan, String> {
     let prompt_file = assemble_claude_prompt_file(&orchestration.preset, &orchestration.contexts)
         .map_err(|error| {
-        format!("failed to prepare Claude append-system-prompt-file payload: {error}")
+        format!(
+            "Cannot launch Claude: failed to prepare the temporary --append-system-prompt-file payload.\n\
+             Detail: {error}\n\
+             Next step: verify the selected preset contexts still exist and are readable, then retry."
+        )
     })?;
     let temporary_prompt_file = TemporaryPromptFile::new(prompt_file.path);
     append_embedded_manifest_to_claude_prompt_file(
@@ -541,12 +607,18 @@ fn build_embedded_manifest_startup_payload(
 fn build_codex_launch_plan(
     orchestration: WrapperStartupOrchestration,
 ) -> Result<CodexLaunchPlan, String> {
-    cleanup_residual_codex_markers_before_launch(&orchestration.preset.preset_working_dir)?;
-
-    let mut injection = inject_codex_agents_md(&orchestration.preset, &orchestration.contexts)
-        .map_err(|error| format!("failed to prepare Codex AGENTS.md payload: {error}"))?;
+    let injection = inject_codex_agents_md(&orchestration.preset, &orchestration.contexts)
+        .map_err(|error| {
+            format!(
+                "Cannot launch Codex: failed to prepare the managed AGENTS.md context block.\n\
+                 Detail: {error}\n\
+                 Safety: AGENTS.md was not overwritten.\n\
+                 Next step: fix malformed or duplicate ctx managed markers in AGENTS.md, or verify the selected preset contexts still exist and are readable."
+            )
+        })?;
+    let mut managed_block = ManagedAgentsMdBlock::new(injection);
     append_embedded_manifest_to_codex_agents_md(
-        &mut injection,
+        &mut managed_block.injection,
         &orchestration.preset,
         orchestration.embedded_manifest.as_ref(),
     )?;
@@ -561,7 +633,7 @@ fn build_codex_launch_plan(
         working_dir: orchestration.preset.preset_working_dir.clone(),
         preset_id: orchestration.preset.preset_id,
         state_dir: default_wrapper_state_dir(),
-        injection: ManagedAgentsMdBlock::new(injection),
+        injection: managed_block,
         embedded_manifest: orchestration.embedded_manifest,
     })
 }
@@ -620,15 +692,6 @@ fn append_model_arg(args: &mut Vec<String>, model: Option<&str>) {
     args.push(model.to_string());
 }
 
-fn cleanup_residual_codex_markers_before_launch(working_dir: &Path) -> Result<bool, String> {
-    cleanup_residual_codex_agents_md_markers(working_dir).map_err(|error| {
-        format!(
-            "refusing to launch Codex because residual ctx marker cleanup failed for {}: {error}. Remove the managed block between <!-- [ctx:start] --> and <!-- [ctx:end] --> or fix AGENTS.md, then retry.",
-            working_dir.join(AGENTS_MD_FILE_NAME).display()
-        )
-    })
-}
-
 fn run_wrapped_claude_session(plan: ClaudeLaunchPlan) -> Result<i32, String> {
     let status = run_claude_launch_plan(&plan);
     drop(plan);
@@ -662,13 +725,9 @@ fn spawn_claude_child(plan: &ClaudeLaunchPlan) -> Result<Child, String> {
     let mut command = Command::new(&plan.program);
     command.args(&plan.args).current_dir(&plan.working_dir);
     configure_interactive_stdio(&mut command);
-    command.spawn().map_err(|error| {
-        format!(
-            "failed to launch Claude CLI with --append-system-prompt-file using '{}' in {}: {error}",
-            plan.program,
-            plan.working_dir.display()
-        )
-    })
+    command
+        .spawn()
+        .map_err(|error| format_claude_launch_spawn_error(plan, &error))
 }
 
 fn run_codex_launch_plan(plan: &CodexLaunchPlan) -> Result<ExitStatus, String> {
@@ -698,13 +757,41 @@ fn spawn_codex_child(plan: &CodexLaunchPlan) -> Result<Child, String> {
     command.args(&plan.args).current_dir(&plan.working_dir);
     configure_interactive_stdio(&mut command);
     configure_child_terminal_signal_defaults(&mut command);
-    command.spawn().map_err(|error| {
-        format!(
-            "failed to launch Codex CLI with managed AGENTS.md using '{}' in {}: {error}",
-            plan.program,
-            plan.working_dir.display()
-        )
-    })
+    command
+        .spawn()
+        .map_err(|error| format_codex_launch_spawn_error(plan, &error))
+}
+
+fn format_claude_launch_spawn_error(plan: &ClaudeLaunchPlan, error: &io::Error) -> String {
+    format!(
+        "Launch failed: Claude CLI did not start.\n\
+         Injection method: temporary prompt file via --append-system-prompt-file.\n\
+         Command: {}\n\
+         Working directory: {}\n\
+         Prompt file: {}\n\
+         Detail: {error}\n\
+         Cleanup: the temporary prompt file will be removed automatically.\n\
+         Next step: verify Claude is installed and executable, or set {CTX_CLAUDE_BIN_ENV} to the Claude CLI path.",
+        plan.program,
+        plan.working_dir.display(),
+        plan.prompt_file.path().display()
+    )
+}
+
+fn format_codex_launch_spawn_error(plan: &CodexLaunchPlan, error: &io::Error) -> String {
+    format!(
+        "Launch failed: Codex CLI did not start.\n\
+         Injection method: managed ctx block in AGENTS.md.\n\
+         Command: {}\n\
+         Working directory: {}\n\
+         AGENTS.md: {}\n\
+         Detail: {error}\n\
+         Cleanup: the managed ctx block will be removed automatically; existing user content is preserved.\n\
+         Next step: verify Codex is installed and executable, or set {CTX_CODEX_BIN_ENV} to the Codex CLI path.",
+        plan.program,
+        plan.working_dir.display(),
+        plan.injection.injection.path.display()
+    )
 }
 
 fn configure_interactive_stdio(command: &mut Command) -> &mut Command {
@@ -1115,11 +1202,15 @@ fn list_sessions() -> Result<(), String> {
 fn classify_session(args: Vec<String>) -> Result<(), String> {
     let session_ref = parse_optional_session_ref(args)?;
     let detail = resolve_session_detail(session_ref.as_deref().unwrap_or("latest"))?;
-    let classification = classify_session_detail(&detail);
+    let classification = classify_work_context_detail(&detail)
+        .map_err(|error| format!("failed to classify session context: {error}"))?;
 
     println!(
-        "{}\t{}\t{}",
-        classification.kind, classification.confidence, classification.rationale
+        "{}\t{}\t{}\t{}",
+        classification.category.as_str(),
+        classification.confidence_score,
+        work_context_category_list(&classification.categories),
+        classification.rationale
     );
     Ok(())
 }
@@ -1127,15 +1218,84 @@ fn classify_session(args: Vec<String>) -> Result<(), String> {
 fn distill_session(args: Vec<String>) -> Result<(), String> {
     let options = parse_distill_args(args)?;
     let detail = resolve_session_detail(options.session_ref.as_deref().unwrap_or("latest"))?;
+    let filtered = filter_work_relevant_content(&detail)
+        .map_err(|error| format!("failed to filter session work context: {error}"))?;
+    let output = if let Some(refiner) = options.refiner {
+        refine_distilled_session_context(refiner, &filtered.handoff_markdown)?
+    } else {
+        filtered.handoff_markdown
+    };
+    let classification = classify_work_context_detail(&detail)
+        .map_err(|error| format!("failed to classify session context: {error}"))?;
 
     if options.save {
-        let context = save_session_context(&detail)?;
+        let refine_mode = if options.refiner.is_some() {
+            WorkContextRefineMode::Refined
+        } else {
+            WorkContextRefineMode::Raw
+        };
+        let launch_target = options
+            .launch_target
+            .unwrap_or_else(|| default_launch_target_for_session_detail(&detail));
+        let context = save_session_context(
+            &detail,
+            &output,
+            &classification,
+            launch_target,
+            refine_mode,
+        )?;
         println!("{}", context.file_path.display());
         return Ok(());
     }
 
-    print!("{}", detail.distilled_markdown);
+    print!("{output}");
     Ok(())
+}
+
+fn list_saved_session_contexts() -> Result<(), String> {
+    let working_dir = env::current_dir()
+        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+    let vault = resolve_overlay_vault(&working_dir)
+        .map_err(|error| format!("failed to resolve saved session contexts: {error}"))?;
+    let contexts = vault
+        .contexts
+        .into_iter()
+        .filter(is_saved_session_context)
+        .collect::<Vec<_>>();
+
+    if contexts.is_empty() {
+        println!("No saved session contexts found.");
+        return Ok(());
+    }
+
+    println!("scope\tcategories\ttitle\tpath");
+    for context in contexts {
+        println!(
+            "{}\t{}\t{}\t{}",
+            scope_label(context.vault_scope),
+            saved_context_category_list(&context),
+            context.title.replace('\n', " "),
+            context.file_path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn is_saved_session_context(context: &ContextFragment) -> bool {
+    let path = context.file_path.display().to_string().to_lowercase();
+    let folder = context.folder_path.display().to_string().to_lowercase();
+    let tags = context
+        .tags
+        .iter()
+        .map(|tag| tag.to_lowercase())
+        .collect::<Vec<_>>();
+
+    folder.contains("session-history")
+        || path.contains("/session-history/")
+        || tags
+            .iter()
+            .any(|tag| tag == "session-history" || tag == "resume-context")
 }
 
 fn parse_optional_session_ref(args: Vec<String>) -> Result<Option<String>, String> {
@@ -1144,7 +1304,9 @@ fn parse_optional_session_ref(args: Vec<String>) -> Result<Option<String>, Strin
         [value] if !value.starts_with('-') => Ok(Some(value.to_string())),
         [flag, value] if flag == "--session" || flag == "-s" => Ok(Some(value.to_string())),
         [flag] if flag.starts_with("--session=") => Ok(Some(
-            flag.strip_prefix("--session=").unwrap_or_default().to_string(),
+            flag.strip_prefix("--session=")
+                .unwrap_or_default()
+                .to_string(),
         )),
         _ => Err("usage: ctx classify [latest|<session-id>]".to_string()),
     }
@@ -1154,16 +1316,43 @@ fn parse_optional_session_ref(args: Vec<String>) -> Result<Option<String>, Strin
 struct DistillArgs {
     session_ref: Option<String>,
     save: bool,
+    refiner: Option<CliTarget>,
+    launch_target: Option<CliTarget>,
 }
 
 fn parse_distill_args(args: Vec<String>) -> Result<DistillArgs, String> {
     let mut session_ref = None;
     let mut save = false;
+    let mut refiner = None;
+    let mut launch_target = None;
     let mut iter = args.into_iter();
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--save" => save = true,
+            "--refine" => refiner = Some(CliTarget::Claude),
+            "--refiner" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--refiner requires claude or codex".to_string())?;
+                refiner = Some(parse_target(Some(&value))?);
+            }
+            value if value.starts_with("--refiner=") => {
+                refiner = Some(parse_target(Some(
+                    value.strip_prefix("--refiner=").unwrap_or_default(),
+                ))?);
+            }
+            "--launch-target" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--launch-target requires claude or codex".to_string())?;
+                launch_target = Some(parse_target(Some(&value))?);
+            }
+            value if value.starts_with("--launch-target=") => {
+                launch_target = Some(parse_target(Some(
+                    value.strip_prefix("--launch-target=").unwrap_or_default(),
+                ))?);
+            }
             "--session" | "-s" => {
                 let value = iter
                     .next()
@@ -1182,13 +1371,21 @@ fn parse_distill_args(args: Vec<String>) -> Result<DistillArgs, String> {
                 session_ref = Some(value.to_string());
             }
             "-h" | "--help" => {
-                return Err("usage: ctx distill [latest|<session-id>] [--save]".to_string())
+                return Err(
+                    "usage: ctx distill [latest|<session-id>] [--refine] [--refiner <claude|codex>] [--save] [--launch-target <claude|codex>]"
+                        .to_string(),
+                )
             }
             other => return Err(format!("unknown ctx distill option: {other}")),
         }
     }
 
-    Ok(DistillArgs { session_ref, save })
+    Ok(DistillArgs {
+        session_ref,
+        save,
+        refiner,
+        launch_target,
+    })
 }
 
 fn lookup_index(args: Vec<String>) -> Result<(), String> {
@@ -1368,44 +1565,13 @@ fn parse_watch_interval_ms(value: &str) -> Result<u64, String> {
     Ok(parsed)
 }
 
-#[derive(Debug, Clone)]
-struct AgentSessionSummary {
-    provider: String,
-    session_id: String,
-    title: String,
-    updated_at: Option<String>,
-    cwd: Option<String>,
-    file_path: PathBuf,
-    message_count: usize,
-    last_user_message: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct AgentSessionMessage {
-    role: String,
-    timestamp: Option<String>,
-    content: String,
-}
-
-#[derive(Debug, Clone)]
-struct AgentSessionDetail {
-    summary: AgentSessionSummary,
-    messages: Vec<AgentSessionMessage>,
-    distilled_markdown: String,
-}
-
-#[derive(Debug, Clone)]
-struct SessionClassification {
-    kind: &'static str,
-    confidence: u8,
-    rationale: &'static str,
-}
-
 fn discover_agent_sessions() -> Result<Vec<AgentSessionSummary>, String> {
     let home = home_dir()?;
+    let working_dir = env::current_dir()
+        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
     let mut sessions = Vec::new();
-    sessions.extend(list_codex_sessions(&home)?);
-    sessions.extend(list_claude_sessions(&home)?);
+    sessions.extend(list_codex_sessions(&home, &working_dir)?);
+    sessions.extend(list_claude_sessions(&home, &working_dir)?);
     sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     Ok(sessions)
 }
@@ -1430,18 +1596,45 @@ fn resolve_session_detail(session_ref: &str) -> Result<AgentSessionDetail, Strin
     };
 
     match session.provider.as_str() {
-        "codex" => parse_codex_session_file(&session.file_path, None),
-        "claude" => parse_claude_session_file(&session.file_path),
+        "codex" => parse_codex_session_log_detail(&session.file_path, None)
+            .map_err(|error| error.to_string()),
+        "claude" => {
+            parse_claude_session_log_detail(&session.file_path).map_err(|error| error.to_string())
+        }
         other => Err(format!("unsupported session provider: {other}")),
     }
 }
 
 fn resolve_session_context_fragment(session_ref: &str) -> Result<ContextFragment, String> {
     let detail = resolve_session_detail(session_ref)?;
-    Ok(session_detail_to_context_fragment(&detail))
+    let classification = classify_work_context_detail(&detail)
+        .map_err(|error| format!("failed to classify selected session context: {error}"))?;
+    Ok(session_detail_to_context_fragment(&detail, &classification))
 }
 
-fn save_session_context(detail: &AgentSessionDetail) -> Result<ContextFragment, String> {
+fn resolve_saved_handoff_context_fragment(
+    working_dir: &Path,
+    handoff_ref: &str,
+) -> Result<ContextFragment, String> {
+    let saved = read_resolved_session_handoff_context(working_dir, &PathBuf::from(handoff_ref))
+        .map_err(|error| {
+            format!("failed to read selected saved session handoff '{handoff_ref}': {error}")
+        })?;
+    let mut fragment = saved.fragment;
+    fragment.title = saved.handoff.title.clone();
+    fragment.content = saved.handoff.handoff_markdown.clone();
+    fragment.session_handoff_classification =
+        Some(session_handoff_metadata_from_handoff(&saved.handoff));
+    Ok(fragment)
+}
+
+fn save_session_context(
+    detail: &AgentSessionDetail,
+    content: &str,
+    classification: &WorkContextClassificationResult,
+    launch_target: CliTarget,
+    refine_mode: WorkContextRefineMode,
+) -> Result<ContextFragment, String> {
     let working_dir = env::current_dir()
         .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
     let roots = ctx_core::VaultRoots::discover(&working_dir);
@@ -1450,94 +1643,365 @@ fn save_session_context(detail: &AgentSessionDetail) -> Result<ContextFragment, 
         sanitize_file_name(&detail.summary.provider),
         sanitize_file_name(&detail.summary.session_id)
     );
-    create_context_file(
+    let signal_set = WorkContextSignalSet::from_session_detail(detail)
+        .map_err(|error| format!("failed to normalize session handoff context: {error}"))?;
+    let handoff = SessionHandoffContext::from_classified_signals(
+        &signal_set,
+        classification,
+        current_timestamp_string()?,
+        content,
+        launch_target,
+        refine_mode,
+    )
+    .map_err(|error| format!("failed to extract classified session handoff fields: {error}"))?;
+    create_session_handoff_context_file(
         &roots,
         VaultScope::Local,
         PathBuf::from("session-history"),
         &file_name,
-        &detail.distilled_markdown,
+        &handoff,
     )
+    .map(|saved| saved.fragment)
     .map_err(|error| format!("failed to save distilled session context: {error}"))
 }
 
-fn session_detail_to_context_fragment(detail: &AgentSessionDetail) -> ContextFragment {
+fn default_launch_target_for_session_detail(detail: &AgentSessionDetail) -> CliTarget {
+    match detail.summary.provider_kind() {
+        Some(SessionLogProvider::Claude) => CliTarget::Claude,
+        Some(SessionLogProvider::Codex) | None => CliTarget::Codex,
+    }
+}
+
+fn current_timestamp_string() -> Result<String, String> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("failed to resolve current timestamp: {error}"))?
+        .as_secs();
+    Ok(format!("unix-seconds:{seconds}"))
+}
+
+fn add_session_category_frontmatter(
+    content: &str,
+    classification: &WorkContextClassificationResult,
+) -> String {
+    let body = strip_existing_frontmatter(content).trim_start();
+    let tags = session_context_tags(classification);
+
+    format!(
+        "---\nclassification: shared\ntags: [{}]\nsource_tool: {}\nsource_session_ref: {}\nsource_working_directory: {}\nsource_log_path: {}\nwork_context_category: {}\nwork_context_categories: [{}]\nwork_context_classification_status: {}\nwork_context_confidence_score: {}\nwork_context_rationale: {}\ndistillation_focus: [{}]\n---\n\n{}",
+        tags.join(", "),
+        classification.source_tool.as_str(),
+        yaml_quoted(&classification.source_session_ref),
+        yaml_quoted(&classification.source_working_directory),
+        yaml_quoted(&classification.source_log_path),
+        classification.category.as_str(),
+        work_context_category_list(&classification.categories),
+        classification_status_label(classification.status),
+        classification.confidence_score,
+        yaml_quoted(&classification.rationale),
+        classification
+            .distillation_focus
+            .iter()
+            .map(|focus| yaml_quoted(focus))
+            .collect::<Vec<_>>()
+            .join(", "),
+        body
+    )
+}
+
+fn yaml_quoted(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn classification_status_label(status: ctx_core::ClassificationStatus) -> &'static str {
+    match status {
+        ctx_core::ClassificationStatus::Pending => "pending",
+        ctx_core::ClassificationStatus::Classified => "classified",
+        ctx_core::ClassificationStatus::Reviewed => "reviewed",
+        ctx_core::ClassificationStatus::Modified => "modified",
+    }
+}
+
+fn strip_existing_frontmatter(content: &str) -> &str {
+    let Some(rest) = content.strip_prefix("---\n") else {
+        return content;
+    };
+    let Some(end_index) = rest.find("\n---") else {
+        return content;
+    };
+    let after_marker = &rest[end_index + "\n---".len()..];
+    after_marker.strip_prefix('\n').unwrap_or(after_marker)
+}
+
+fn session_context_tags(classification: &WorkContextClassificationResult) -> Vec<String> {
+    let mut tags = classification.suggested_tags.clone();
+    for tag in [
+        "session-history".to_string(),
+        "resume-context".to_string(),
+        classification.source_tool.as_str().to_string(),
+    ] {
+        if !tags.iter().any(|existing| existing == &tag) {
+            tags.push(tag);
+        }
+    }
+    for category in &classification.categories {
+        let tag = category.as_str().to_string();
+        if !tags.iter().any(|existing| existing == &tag) {
+            tags.push(tag);
+        }
+    }
+    tags
+}
+
+fn work_context_category_list(categories: &[WorkContextCategory]) -> String {
+    categories
+        .iter()
+        .map(|category| category.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn saved_context_category_list(context: &ContextFragment) -> String {
+    let mut category_tags = context
+        .tags
+        .iter()
+        .filter(|tag| tag_is_work_context_category(tag))
+        .cloned()
+        .collect::<Vec<_>>();
+    if category_tags.is_empty() {
+        category_tags = saved_context_categories_from_frontmatter(&context.content);
+    }
+    if category_tags.is_empty() {
+        "-".to_string()
+    } else {
+        category_tags.join(", ")
+    }
+}
+
+fn saved_context_categories_from_frontmatter(content: &str) -> Vec<String> {
+    let Some(rest) = content.strip_prefix("---\n") else {
+        return Vec::new();
+    };
+    let Some(end_index) = rest.find("\n---") else {
+        return Vec::new();
+    };
+    let frontmatter = &rest[..end_index];
+    let mut primary_category = None;
+    let mut categories = Vec::new();
+
+    for line in frontmatter.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key == "work_context_categories" {
+            categories = parse_work_context_category_list(value);
+        } else if key == "work_context_category" {
+            primary_category = parse_work_context_category_token(value);
+        }
+    }
+
+    if categories.is_empty() {
+        if let Some(category) = primary_category {
+            categories.push(category);
+        }
+    }
+    categories
+}
+
+fn parse_work_context_category_list(value: &str) -> Vec<String> {
+    let trimmed = value
+        .trim()
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(value);
+
+    trimmed
+        .split(',')
+        .filter_map(parse_work_context_category_token)
+        .collect()
+}
+
+fn parse_work_context_category_token(value: &str) -> Option<String> {
+    let category = value.trim().trim_matches('"').trim_matches('\'');
+    tag_is_work_context_category(category).then(|| category.to_string())
+}
+
+fn tag_is_work_context_category(tag: &str) -> bool {
+    matches!(
+        tag,
+        "implementation"
+            | "debugging"
+            | "review"
+            | "planning"
+            | "refactor"
+            | "research"
+            | "verification"
+            | "launch"
+            | "general"
+    )
+}
+
+fn refine_distilled_session_context(target: CliTarget, draft: &str) -> Result<String, String> {
+    if draft.trim().is_empty() {
+        return Err("cannot refine an empty session draft".to_string());
+    }
+
+    let prompt = build_session_refinement_prompt(draft);
+    let output = match target {
+        CliTarget::Claude => {
+            let program = resolve_claude_command()?;
+            Command::new(&program)
+                .arg("--print")
+                .arg("--output-format")
+                .arg("text")
+                .arg(prompt)
+                .output()
+                .map_err(|error| {
+                    format!("failed to launch Claude refinement CLI '{program}': {error}")
+                })?
+        }
+        CliTarget::Codex => {
+            let program = resolve_codex_command()?;
+            Command::new(&program)
+                .arg("exec")
+                .arg(prompt)
+                .output()
+                .map_err(|error| {
+                    format!("failed to launch Codex refinement CLI '{program}': {error}")
+                })?
+        }
+    };
+
+    if !output.status.success() {
+        return Err(format!(
+            "refinement CLI exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let refined = String::from_utf8(output.stdout)
+        .map_err(|error| format!("refinement CLI returned non-UTF8 output: {error}"))?;
+    let refined = refined.trim();
+    if refined.is_empty() {
+        return Err("refinement CLI returned empty output".to_string());
+    }
+
+    Ok(refined.to_string())
+}
+
+fn build_session_refinement_prompt(draft: &str) -> String {
+    format!(
+        r#"You are preparing context for a new coding-agent session.
+
+Rewrite the raw previous-session transcript into a concise Korean handoff note.
+Do not invent facts. Preserve concrete filenames, commands, decisions, verification results, blockers, and remaining work when present.
+Remove noisy tool output and repeated status chatter.
+
+Return only markdown with this structure:
+
+# 새 세션 시작 컨텍스트
+
+## 목표
+
+## 완료한 작업
+
+## 변경한 파일
+
+## 중요한 결정
+
+## 검증 결과
+
+## 남은 작업
+
+## 주의사항
+
+## 새 세션 시작 프롬프트
+
+Raw previous-session draft:
+
+```markdown
+{draft}
+```
+"#
+    )
+}
+
+fn session_detail_to_context_fragment(
+    detail: &AgentSessionDetail,
+    classification: &WorkContextClassificationResult,
+) -> ContextFragment {
+    let tags = session_context_tags(classification);
+    let filtered = filter_work_relevant_content(detail).ok();
+    let body = filtered
+        .as_ref()
+        .map(|content| content.handoff_markdown.as_str())
+        .unwrap_or(detail.distilled_markdown.as_str());
+    let content = add_session_category_frontmatter(body, classification);
     ContextFragment {
         context_id: Uuid::new_v4(),
-        title: format!("{} session {}", detail.summary.provider, detail.summary.session_id),
-        content: detail.distilled_markdown.clone(),
+        title: classification.title.clone(),
+        content,
         file_path: detail.summary.file_path.clone(),
         vault_scope: VaultScope::Local,
         classification: Classification::Shared,
         import_classification_suggestion: Some(Classification::Shared),
         inferred_classification: Some(Classification::Shared),
-        tags: vec![
-            "session-history".to_string(),
-            "resume-context".to_string(),
-            detail.summary.provider.clone(),
-        ],
+        tags,
         folder_path: PathBuf::from("session-history"),
         wikilinks: Vec::new(),
         backlinks: Vec::new(),
         import_source: Some(detail.summary.file_path.clone()),
         import_source_type: None,
-        llm_classification_status: ClassificationStatus::Reviewed,
+        llm_classification_status: classification.status,
+        session_handoff_classification: Some(session_handoff_metadata_from_classification(
+            classification,
+        )),
     }
 }
 
-fn classify_session_detail(detail: &AgentSessionDetail) -> SessionClassification {
-    let haystack = detail
-        .messages
-        .iter()
-        .map(|message| message.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_lowercase();
-
-    if contains_any(&haystack, &["review", "리뷰", "검토", "risk", "regression"]) {
-        return SessionClassification {
-            kind: "review",
-            confidence: 82,
-            rationale: "session contains review/risk language",
-        };
-    }
-    if contains_any(&haystack, &["bug", "fix", "error", "오류", "실패", "debug"]) {
-        return SessionClassification {
-            kind: "debugging",
-            confidence: 80,
-            rationale: "session contains bug/error/fix language",
-        };
-    }
-    if contains_any(&haystack, &["plan", "설계", "기획", "requirements", "interview"]) {
-        return SessionClassification {
-            kind: "planning",
-            confidence: 76,
-            rationale: "session contains planning/requirements language",
-        };
-    }
-    if contains_any(&haystack, &["refactor", "리팩터", "cleanup", "rename"]) {
-        return SessionClassification {
-            kind: "refactor",
-            confidence: 74,
-            rationale: "session contains refactor/cleanup language",
-        };
-    }
-    if contains_any(&haystack, &["implement", "구현", "add", "build", "feature"]) {
-        return SessionClassification {
-            kind: "implementation",
-            confidence: 78,
-            rationale: "session contains implementation/build language",
-        };
-    }
-
-    SessionClassification {
-        kind: "general",
-        confidence: 55,
-        rationale: "no strong task-type signal found",
+fn session_handoff_metadata_from_classification(
+    classification: &WorkContextClassificationResult,
+) -> SessionHandoffClassificationMetadata {
+    SessionHandoffClassificationMetadata {
+        source_tool: classification.source_tool.as_str().to_string(),
+        source_session_ref: classification.source_session_ref.clone(),
+        source_working_directory: classification.source_working_directory.clone(),
+        source_log_path: classification.source_log_path.clone(),
+        work_context_category: classification.category.as_str().to_string(),
+        work_context_categories: classification
+            .categories
+            .iter()
+            .map(|category| category.as_str().to_string())
+            .collect(),
+        work_context_classification_status: classification.status,
+        work_context_confidence_score: classification.confidence_score,
+        work_context_rationale: classification.rationale.clone(),
+        distillation_focus: classification.distillation_focus.clone(),
     }
 }
 
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
+fn session_handoff_metadata_from_handoff(
+    handoff: &SessionHandoffContext,
+) -> SessionHandoffClassificationMetadata {
+    SessionHandoffClassificationMetadata {
+        source_tool: handoff.source_tool.as_str().to_string(),
+        source_session_ref: handoff.source_session_ref.clone(),
+        source_working_directory: handoff.source_working_directory.clone(),
+        source_log_path: handoff.source_log_path.clone(),
+        work_context_category: handoff.category.as_str().to_string(),
+        work_context_categories: handoff
+            .categories
+            .iter()
+            .map(|category| category.as_str().to_string())
+            .collect(),
+        work_context_classification_status: handoff.classification_status,
+        work_context_confidence_score: handoff.classification_confidence_score,
+        work_context_rationale: handoff.classification_rationale.clone(),
+        distillation_focus: Vec::new(),
+    }
 }
 
 fn home_dir() -> Result<PathBuf, String> {
@@ -1546,373 +2010,52 @@ fn home_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "HOME directory is not available".to_string())
 }
 
-fn list_codex_sessions(home_dir: &Path) -> Result<Vec<AgentSessionSummary>, String> {
-    let codex_root = home_dir.join(".codex");
-    let session_root = codex_root.join("sessions");
-    if !session_root.exists() {
-        return Ok(Vec::new());
-    }
+fn list_codex_sessions(
+    home_dir: &Path,
+    working_dir: &Path,
+) -> Result<Vec<AgentSessionSummary>, String> {
+    let roots = ctx_core::VaultRoots::discover(working_dir);
+    let codex_roots = resolve_codex_session_log_roots(&roots, working_dir, home_dir)
+        .map_err(|error| format!("failed to resolve Codex session log roots: {error}"))?;
+    let root_paths = codex_roots
+        .into_iter()
+        .map(|root| root.path)
+        .collect::<Vec<_>>();
+    let scanner = CodexSessionLogScanner;
+    let result = scanner
+        .scan_session_logs(&SessionLogScanRequest {
+            provider: SessionLogProvider::Codex,
+            home_dir: home_dir.to_path_buf(),
+            working_dir: working_dir.to_path_buf(),
+            root_paths,
+        })
+        .map_err(|error| error.to_string())?;
 
-    let index = read_codex_session_index(&codex_root.join("session_index.jsonl"))?;
-    let mut files = Vec::new();
-    collect_jsonl_files(&session_root, &mut files).map_err(|error| error.to_string())?;
-
-    let mut sessions = Vec::new();
-    for file in files {
-        if let Ok(detail) = parse_codex_session_file(&file, Some(&index)) {
-            sessions.push(detail.summary);
-        }
-    }
-    Ok(sessions)
+    Ok(result.sessions)
 }
 
-fn list_claude_sessions(home_dir: &Path) -> Result<Vec<AgentSessionSummary>, String> {
-    let claude_root = home_dir.join(".claude").join("projects");
-    if !claude_root.exists() {
-        return Ok(Vec::new());
-    }
+fn list_claude_sessions(
+    home_dir: &Path,
+    working_dir: &Path,
+) -> Result<Vec<AgentSessionSummary>, String> {
+    let roots = ctx_core::VaultRoots::discover(working_dir);
+    let claude_roots = resolve_claude_session_log_roots(&roots, working_dir, home_dir)
+        .map_err(|error| format!("failed to resolve Claude session log roots: {error}"))?;
+    let root_paths = claude_roots
+        .into_iter()
+        .map(|root| root.path)
+        .collect::<Vec<_>>();
+    let scanner = ClaudeSessionLogScanner;
+    let result = scanner
+        .scan_session_logs(&SessionLogScanRequest {
+            provider: SessionLogProvider::Claude,
+            home_dir: home_dir.to_path_buf(),
+            working_dir: working_dir.to_path_buf(),
+            root_paths,
+        })
+        .map_err(|error| error.to_string())?;
 
-    let mut files = Vec::new();
-    collect_jsonl_files(&claude_root, &mut files).map_err(|error| error.to_string())?;
-
-    let mut sessions = Vec::new();
-    for file in files {
-        if file
-            .components()
-            .any(|component| component.as_os_str() == "subagents")
-        {
-            continue;
-        }
-        if let Ok(detail) = parse_claude_session_file(&file) {
-            if detail.summary.message_count > 0 {
-                sessions.push(detail.summary);
-            }
-        }
-    }
-    Ok(sessions)
-}
-
-fn collect_jsonl_files(root: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_jsonl_files(&path, files)?;
-        } else if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
-            files.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn read_codex_session_index(index_path: &Path) -> Result<HashMap<String, (String, String)>, String> {
-    let mut index = HashMap::new();
-    if !index_path.exists() {
-        return Ok(index);
-    }
-
-    let content = fs::read_to_string(index_path).map_err(|error| error.to_string())?;
-    for line in content.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(id) = value.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        let title = value
-            .get("thread_name")
-            .and_then(Value::as_str)
-            .unwrap_or("Codex session")
-            .to_string();
-        let updated_at = value
-            .get("updated_at")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        index.insert(id.to_string(), (title, updated_at));
-    }
-    Ok(index)
-}
-
-fn parse_codex_session_file(
-    file_path: &Path,
-    index: Option<&HashMap<String, (String, String)>>,
-) -> Result<AgentSessionDetail, String> {
-    let content = fs::read_to_string(file_path).map_err(|error| error.to_string())?;
-    let mut session_id = file_stem_session_id(file_path);
-    let mut cwd = None;
-    let mut created_at = None;
-    let mut messages = Vec::new();
-    let mut last_user_message = None;
-
-    for line in content.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let timestamp = value
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
-        let record_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
-        let payload = value.get("payload").unwrap_or(&Value::Null);
-
-        if record_type == "session_meta" {
-            if let Some(id) = payload.get("id").and_then(Value::as_str) {
-                session_id = id.to_string();
-            }
-            cwd = payload
-                .get("cwd")
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            created_at = payload
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-                .or(timestamp);
-            continue;
-        }
-
-        if record_type == "event_msg" {
-            match payload.get("type").and_then(Value::as_str).unwrap_or_default() {
-                "user_message" => {
-                    if let Some(message) = payload.get("message").and_then(Value::as_str) {
-                        let text = truncate_text(message, 12_000);
-                        last_user_message = Some(truncate_text(&text, 220));
-                        messages.push(AgentSessionMessage {
-                            role: "user".to_string(),
-                            timestamp,
-                            content: text,
-                        });
-                    }
-                }
-                "agent_message" => {
-                    if let Some(message) = payload.get("message").and_then(Value::as_str) {
-                        messages.push(AgentSessionMessage {
-                            role: "assistant".to_string(),
-                            timestamp,
-                            content: truncate_text(message, 12_000),
-                        });
-                    }
-                }
-                _ => {}
-            }
-            continue;
-        }
-
-        if record_type == "response_item"
-            && payload.get("type").and_then(Value::as_str) == Some("message")
-        {
-            let role = payload
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("assistant")
-                .to_string();
-            let text = text_from_json_content(payload.get("content").unwrap_or(&Value::Null));
-            if !text.trim().is_empty() {
-                messages.push(AgentSessionMessage {
-                    role,
-                    timestamp,
-                    content: truncate_text(&text, 12_000),
-                });
-            }
-        }
-    }
-
-    let (indexed_title, indexed_updated_at) = index
-        .and_then(|entries| entries.get(&session_id))
-        .cloned()
-        .unwrap_or_default();
-    let title = if indexed_title.trim().is_empty() {
-        last_user_message
-            .clone()
-            .unwrap_or_else(|| "Codex session".to_string())
-    } else {
-        indexed_title
-    };
-    let updated_at = if indexed_updated_at.trim().is_empty() {
-        created_at.or_else(|| modified_time_string(file_path))
-    } else {
-        Some(indexed_updated_at)
-    };
-    let summary = AgentSessionSummary {
-        provider: "codex".to_string(),
-        session_id,
-        title: truncate_text(&title, 120),
-        updated_at,
-        cwd,
-        file_path: file_path.to_path_buf(),
-        message_count: messages.len(),
-        last_user_message,
-    };
-    let distilled_markdown = distilled_session_markdown(&summary, &messages);
-    Ok(AgentSessionDetail {
-        summary,
-        messages,
-        distilled_markdown,
-    })
-}
-
-fn parse_claude_session_file(file_path: &Path) -> Result<AgentSessionDetail, String> {
-    let content = fs::read_to_string(file_path).map_err(|error| error.to_string())?;
-    let mut session_id = file_stem_session_id(file_path);
-    let mut cwd = None;
-    let mut updated_at = None;
-    let mut messages = Vec::new();
-    let mut last_user_message = None;
-
-    for line in content.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let record_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
-        if let Some(id) = value.get("sessionId").and_then(Value::as_str) {
-            session_id = id.to_string();
-        }
-        if cwd.is_none() {
-            cwd = value.get("cwd").and_then(Value::as_str).map(ToString::to_string);
-        }
-        let timestamp = value
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
-        if timestamp.is_some() {
-            updated_at = timestamp.clone();
-        }
-
-        match record_type {
-            "user" | "assistant" => {
-                let message = value.get("message").unwrap_or(&Value::Null);
-                let role = message
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .unwrap_or(record_type)
-                    .to_string();
-                let text = text_from_json_content(message.get("content").unwrap_or(&Value::Null));
-                if !text.trim().is_empty() {
-                    let text = truncate_text(&text, 12_000);
-                    if role == "user" {
-                        last_user_message = Some(truncate_text(&text, 220));
-                    }
-                    messages.push(AgentSessionMessage {
-                        role,
-                        timestamp,
-                        content: text,
-                    });
-                }
-            }
-            "queue-operation" => {
-                if let Some(message) = value.get("content").and_then(Value::as_str) {
-                    let text = truncate_text(message, 12_000);
-                    last_user_message = Some(truncate_text(&text, 220));
-                    messages.push(AgentSessionMessage {
-                        role: "user".to_string(),
-                        timestamp,
-                        content: text,
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let title = last_user_message
-        .clone()
-        .unwrap_or_else(|| "Claude session".to_string());
-    let summary = AgentSessionSummary {
-        provider: "claude".to_string(),
-        session_id,
-        title: truncate_text(&title, 120),
-        updated_at: updated_at.or_else(|| modified_time_string(file_path)),
-        cwd,
-        file_path: file_path.to_path_buf(),
-        message_count: messages.len(),
-        last_user_message,
-    };
-    let distilled_markdown = distilled_session_markdown(&summary, &messages);
-    Ok(AgentSessionDetail {
-        summary,
-        messages,
-        distilled_markdown,
-    })
-}
-
-fn text_from_json_content(content: &Value) -> String {
-    match content {
-        Value::String(text) => text.clone(),
-        Value::Array(items) => items
-            .iter()
-            .filter_map(|item| {
-                item.as_str()
-                    .map(ToString::to_string)
-                    .or_else(|| item.get("text").and_then(Value::as_str).map(ToString::to_string))
-                    .or_else(|| {
-                        item.get("content")
-                            .map(text_from_json_content)
-                            .filter(|text| !text.trim().is_empty())
-                    })
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-        Value::Object(map) => map
-            .get("text")
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-            .or_else(|| {
-                map.get("content")
-                    .map(text_from_json_content)
-                    .filter(|text| !text.trim().is_empty())
-            })
-            .unwrap_or_default(),
-        _ => String::new(),
-    }
-}
-
-fn distilled_session_markdown(
-    summary: &AgentSessionSummary,
-    messages: &[AgentSessionMessage],
-) -> String {
-    let mut markdown = String::new();
-    markdown.push_str("---\n");
-    markdown.push_str("classification: shared\n");
-    markdown.push_str("tags: [session-history, resume-context]\n");
-    markdown.push_str("---\n\n");
-    markdown.push_str("# Previous Session Context\n\n");
-    markdown.push_str(&format!("- Provider: {}\n", summary.provider));
-    markdown.push_str(&format!("- Session ID: {}\n", summary.session_id));
-    if let Some(updated_at) = &summary.updated_at {
-        markdown.push_str(&format!("- Updated: {updated_at}\n"));
-    }
-    if let Some(cwd) = &summary.cwd {
-        markdown.push_str(&format!("- Working directory: `{cwd}`\n"));
-    }
-    markdown.push_str(&format!("- Source log: `{}`\n\n", summary.file_path.display()));
-    markdown.push_str("## New Session Handoff\n\n");
-    markdown.push_str("- Review this distilled context before relying on it.\n");
-    markdown.push_str("- Remove stale decisions, noisy tool output, and sensitive details.\n\n");
-    markdown.push_str("## Conversation Timeline\n\n");
-
-    for message in messages.iter().take(80) {
-        let role = match message.role.as_str() {
-            "user" => "User",
-            "assistant" => "Assistant",
-            other => other,
-        };
-        if let Some(timestamp) = &message.timestamp {
-            markdown.push_str(&format!("### {role} ({timestamp})\n\n"));
-        } else {
-            markdown.push_str(&format!("### {role}\n\n"));
-        }
-        markdown.push_str(message.content.trim());
-        markdown.push_str("\n\n");
-    }
-
-    if messages.len() > 80 {
-        markdown.push_str(&format!(
-            "_{} later messages omitted from this draft._\n",
-            messages.len() - 80
-        ));
-    }
-    markdown
+    Ok(result.sessions)
 }
 
 fn format_session_row(session: &AgentSessionSummary) -> String {
@@ -1925,32 +2068,6 @@ fn format_session_row(session: &AgentSessionSummary) -> String {
         session.cwd.as_deref().unwrap_or("-"),
         session.title.replace('\n', " ")
     )
-}
-
-fn file_stem_session_id(file_path: &Path) -> String {
-    file_path
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or("unknown-session")
-        .trim_start_matches("rollout-")
-        .to_string()
-}
-
-fn modified_time_string(file_path: &Path) -> Option<String> {
-    fs::metadata(file_path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map(|duration| format!("{}s", duration.as_secs()))
-}
-
-fn truncate_text(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut truncated = text.chars().take(max_chars).collect::<String>();
-    truncated.push_str("...");
-    truncated
 }
 
 fn sanitize_file_name(value: &str) -> String {
@@ -2055,6 +2172,7 @@ fn parse_target(value: Option<&str>) -> Result<CliTarget, String> {
 fn parse_launch_args(args: Vec<String>) -> Result<LaunchArgs, String> {
     let mut preset_ref = None;
     let mut session_ref = None;
+    let mut handoff_ref = None;
     let mut passthrough_args = Vec::new();
     let mut iter = args.into_iter();
     let mut passthrough_only = false;
@@ -2089,6 +2207,19 @@ fn parse_launch_args(args: Vec<String>) -> Result<LaunchArgs, String> {
                     return Err("--session can only be supplied once".to_string());
                 }
             }
+            "--handoff" | "--saved" => {
+                let value = iter.next().ok_or_else(|| {
+                    "--handoff requires a saved session handoff markdown path".to_string()
+                })?;
+                if value.trim().is_empty() {
+                    return Err(
+                        "--handoff requires a saved session handoff markdown path".to_string()
+                    );
+                }
+                if handoff_ref.replace(value).is_some() {
+                    return Err("--handoff can only be supplied once".to_string());
+                }
+            }
             value if value.starts_with("--preset=") => {
                 let value = value
                     .strip_prefix("--preset=")
@@ -2113,6 +2244,20 @@ fn parse_launch_args(args: Vec<String>) -> Result<LaunchArgs, String> {
                     return Err("--session can only be supplied once".to_string());
                 }
             }
+            value if value.starts_with("--handoff=") || value.starts_with("--saved=") => {
+                let value = value
+                    .split_once('=')
+                    .map(|(_, value)| value.to_string())
+                    .unwrap_or_default();
+                if value.trim().is_empty() {
+                    return Err(
+                        "--handoff requires a saved session handoff markdown path".to_string()
+                    );
+                }
+                if handoff_ref.replace(value).is_some() {
+                    return Err("--handoff can only be supplied once".to_string());
+                }
+            }
             _ => passthrough_args.push(arg),
         }
     }
@@ -2120,6 +2265,7 @@ fn parse_launch_args(args: Vec<String>) -> Result<LaunchArgs, String> {
     Ok(LaunchArgs {
         preset_ref,
         session_ref,
+        handoff_ref,
         passthrough_args,
     })
 }
@@ -2133,9 +2279,10 @@ fn print_help() {
     println!("  ctx cleanup");
     println!("  ctx list");
     println!("  ctx scan");
+    println!("  ctx saved");
     println!("  ctx classify [latest|<session-id>]");
-    println!("  ctx distill [latest|<session-id>] [--save]");
-    println!("  ctx launch <claude|codex> [--session <latest|session-id>] [--preset <id|file-stem|name>] [-- cli args...]");
+    println!("  ctx distill [latest|<session-id>] [--refine] [--refiner <claude|codex>] [--save]");
+    println!("  ctx launch <claude|codex> [--session <latest|session-id>|--handoff <saved-md-path>] [--preset <id|file-stem|name>] [-- cli args...]");
     println!("  ctx context <list|scan|import|classify|reindex|lookup|watch>");
 }
 
@@ -2156,14 +2303,243 @@ fn print_context_help() {
 mod tests {
     use super::*;
     use ctx_core::{
-        create_context_file, managed_presets_dir, Classification, ClassificationStatus, VaultRoots,
-        VaultScope, AGENTS_MD_FILE_NAME, CTX_END_MARKER, CTX_START_MARKER,
+        create_context_file, list_context_files, managed_presets_dir, Classification,
+        ClassificationStatus, InjectionStrategy, SessionLogMessage as AgentSessionMessage,
+        VaultRoots, VaultScope, AGENTS_MD_FILE_NAME, CTX_END_MARKER, CTX_START_MARKER,
         MAX_SUBAGENT_MANIFEST_JSON_BYTES,
     };
     use std::sync::{Mutex, MutexGuard};
     use uuid::Uuid;
 
     static HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn saved_session_context_persists_categories_in_frontmatter_for_listing() {
+        let workspace = temp_workspace();
+        let roots = VaultRoots {
+            global_root: workspace.join("global-vault"),
+            local_root: Some(workspace.join(".ctx").join("vault")),
+        };
+        let detail = AgentSessionDetail {
+            summary: AgentSessionSummary {
+                provider: "codex".to_string(),
+                session_id: "category-save-1".to_string(),
+                title: "Implement launch handoff".to_string(),
+                updated_at: Some("2026-05-11T00:00:00Z".to_string()),
+                cwd: Some(workspace.display().to_string()),
+                file_path: workspace.join("category-save-1.jsonl"),
+                message_count: 1,
+                last_user_message: Some("Implement launch handoff".to_string()),
+            },
+            messages: vec![AgentSessionMessage {
+                role: "assistant".to_string(),
+                timestamp: Some("2026-05-11T00:01:00Z".to_string()),
+                content: "Summary: Implemented Codex launch handoff injection.\nVerified with cargo test -p ctx-core work_context::tests.".to_string(),
+            }],
+            events: Vec::new(),
+            distilled_markdown:
+                "---\ntags: [old]\n---\n\n# Previous Session Context\n\nLaunch work.".to_string(),
+        };
+        let classification =
+            classify_work_context_detail(&detail).expect("session detail should classify");
+        let expected_categories = work_context_category_list(&classification.categories);
+        let content = add_session_category_frontmatter(&detail.distilled_markdown, &classification);
+
+        assert!(content.contains(&format!(
+            "work_context_category: {}",
+            classification.category.as_str()
+        )));
+        assert!(content.contains(&format!("work_context_categories: [{expected_categories}]")));
+        assert!(content.contains("source_tool: codex"));
+        assert!(content.contains("source_session_ref: \"category-save-1\""));
+        assert!(content.contains("work_context_classification_status: classified"));
+        assert!(content.contains("work_context_confidence_score: "));
+        assert!(content.contains("work_context_rationale: \""));
+        assert!(content.contains("distillation_focus: ["));
+        assert!(content.contains("tags: [session-history, resume-context, codex"));
+        assert!(!content.contains("tags: [old]"));
+
+        create_context_file(
+            &roots,
+            VaultScope::Local,
+            "session-history",
+            "codex-category-save-1.md",
+            &content,
+        )
+        .expect("saved session context should be created");
+
+        let contexts = list_context_files(&roots).expect("saved contexts should list");
+        let saved = contexts
+            .iter()
+            .find(|context| context.file_path.ends_with("codex-category-save-1.md"))
+            .expect("saved context should be listed after reload");
+
+        assert_eq!(saved_context_category_list(saved), expected_categories);
+        let metadata = saved
+            .session_handoff_classification
+            .as_ref()
+            .expect("saved session context should reload handoff classification metadata");
+        assert_eq!(metadata.source_tool, "codex");
+        assert_eq!(metadata.source_session_ref, "category-save-1");
+        assert_eq!(
+            metadata.work_context_category,
+            classification.category.as_str()
+        );
+        assert_eq!(
+            metadata.work_context_categories,
+            classification
+                .categories
+                .iter()
+                .map(|category| category.as_str().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            metadata.work_context_classification_status,
+            classification.status
+        );
+        assert_eq!(
+            metadata.work_context_confidence_score,
+            classification.confidence_score
+        );
+        assert_eq!(metadata.work_context_rationale, classification.rationale);
+        assert!(saved.content.contains("tags: [session-history"));
+        assert!(saved.content.contains("work_context_categories: ["));
+    }
+
+    #[test]
+    fn save_session_context_serializes_full_validated_handoff_entry() {
+        let _guard = HOME_ENV_LOCK
+            .lock()
+            .expect("HOME env lock should not be poisoned");
+        let workspace = temp_workspace();
+        let previous_dir = env::current_dir().expect("current dir should resolve");
+        env::set_current_dir(&workspace).expect("test workspace should become current dir");
+
+        let detail = AgentSessionDetail {
+            summary: AgentSessionSummary {
+                provider: "claude".to_string(),
+                session_id: "save-full-1".to_string(),
+                title: "Save full handoff entry".to_string(),
+                updated_at: Some("2026-05-11T00:00:00Z".to_string()),
+                cwd: Some(workspace.display().to_string()),
+                file_path: workspace.join("save-full-1.jsonl"),
+                message_count: 1,
+                last_user_message: Some("Save full handoff entry".to_string()),
+            },
+            messages: vec![AgentSessionMessage {
+                role: "assistant".to_string(),
+                timestamp: Some("2026-05-11T00:01:00Z".to_string()),
+                content: "Summary: Saved complete reusable handoff metadata.\nChanged files: crates/ctx-cli/src/bin/ctx.rs.\nDecision: Validate before writing session handoffs.\nVerified with cargo test -p ctx-cli save_session_context_serializes_full_validated_handoff_entry.\nRemaining work: launch saved entries."
+                    .to_string(),
+            }],
+            events: Vec::new(),
+            distilled_markdown: "# Previous Session Context".to_string(),
+        };
+        let classification =
+            classify_work_context_detail(&detail).expect("session detail should classify");
+
+        let saved = save_session_context(
+            &detail,
+            "---\ntags: [stale]\n---\n\n# Previous Session Context\n\n## Handoff Summary\n\nSaved complete reusable handoff metadata.\n\n### Goals\n\n- Save full handoff entry\n\n### Key changed files\n\n- crates/ctx-cli/src/bin/ctx.rs\n\n### Decisions\n\n- Validate before writing session handoffs.\n\n### Verification results\n\n- Verified with cargo test -p ctx-cli save_session_context_serializes_full_validated_handoff_entry.\n\n### Remaining work\n\n- launch saved entries.",
+            &classification,
+            CliTarget::Claude,
+            WorkContextRefineMode::Raw,
+        )
+        .expect("complete session handoff should save");
+
+        env::set_current_dir(previous_dir).expect("test cwd should be restored");
+
+        let content =
+            fs::read_to_string(saved.file_path).expect("saved handoff markdown should be readable");
+        assert!(content.contains("session_handoff_format_version: 1"));
+        assert!(content.contains("source_tool: claude"));
+        assert!(content.contains("source_session_ref: \"save-full-1\""));
+        assert!(content.contains("summary: \"Saved complete reusable handoff metadata.\""));
+        assert!(content.contains("key_changed_files: [\"crates/ctx-cli/src/bin/ctx.rs\"]"));
+        assert!(content.contains("decisions: [\"Validate before writing session handoffs.\"]"));
+        assert!(content.contains("verification_results: [\"Verified with cargo test -p ctx-cli save_session_context_serializes_full_validated_handoff_entry.\"]"));
+        assert!(content.contains("remaining_work: [\"launch saved entries.\"]"));
+        assert!(content.contains("launch_target: claude"));
+        assert!(content.contains("injection_method: append-system-prompt-file"));
+        assert!(content.ends_with("- launch saved entries."));
+        assert!(!content.contains("tags: [stale]"));
+    }
+
+    #[test]
+    fn save_session_context_preserves_unrelated_saved_entries() {
+        let _guard = HOME_ENV_LOCK
+            .lock()
+            .expect("HOME env lock should not be poisoned");
+        let workspace = temp_workspace();
+        let roots = VaultRoots {
+            global_root: workspace.join("global-vault"),
+            local_root: Some(workspace.join(".ctx").join("vault")),
+        };
+        let unrelated_content = "---\nclassification: shared\ntags: [session-history]\n---\n\n# Existing Handoff\n\nKeep this entry.";
+        let unrelated = create_context_file(
+            &roots,
+            VaultScope::Local,
+            "session-history",
+            "codex-existing-session.md",
+            unrelated_content,
+        )
+        .expect("unrelated saved session entry should be created");
+
+        let previous_dir = env::current_dir().expect("current dir should resolve");
+        env::set_current_dir(&workspace).expect("test workspace should become current dir");
+        let detail = AgentSessionDetail {
+            summary: AgentSessionSummary {
+                provider: "codex".to_string(),
+                session_id: "new-save-1".to_string(),
+                title: "Persist new handoff entry".to_string(),
+                updated_at: Some("2026-05-11T00:00:00Z".to_string()),
+                cwd: Some(workspace.display().to_string()),
+                file_path: workspace.join("new-save-1.jsonl"),
+                message_count: 1,
+                last_user_message: Some("Persist new handoff entry".to_string()),
+            },
+            messages: vec![AgentSessionMessage {
+                role: "assistant".to_string(),
+                timestamp: Some("2026-05-11T00:01:00Z".to_string()),
+                content: "Summary: Saved a new reusable handoff.\nDecision: Preserve existing saved entries.\nVerified with cargo test -p ctx-cli save_session_context_preserves_unrelated_saved_entries."
+                    .to_string(),
+            }],
+            events: Vec::new(),
+            distilled_markdown: "# Previous Session Context".to_string(),
+        };
+        let classification =
+            classify_work_context_detail(&detail).expect("session detail should classify");
+
+        let saved = save_session_context(
+            &detail,
+            "# Previous Session Context\n\n## Handoff Summary\n\nSaved a new reusable handoff.\n\n### Goals\n\n- Persist new handoff entry\n\n### Decisions\n\n- Preserve existing saved entries.\n\n### Verification results\n\n- Verified with cargo test -p ctx-cli save_session_context_preserves_unrelated_saved_entries.",
+            &classification,
+            CliTarget::Codex,
+            WorkContextRefineMode::Raw,
+        )
+        .expect("new session handoff should save beside existing entries");
+
+        env::set_current_dir(previous_dir).expect("test cwd should be restored");
+
+        assert_ne!(saved.file_path, unrelated.file_path);
+        assert_eq!(
+            fs::read_to_string(&unrelated.file_path)
+                .expect("unrelated saved entry should remain readable"),
+            unrelated_content
+        );
+        assert!(fs::read_to_string(&saved.file_path)
+            .expect("new saved handoff should be readable")
+            .contains("source_session_ref: \"new-save-1\""));
+
+        let contexts = list_context_files(&roots).expect("saved session entries should list");
+        assert_eq!(
+            contexts
+                .iter()
+                .filter(|context| context.folder_path == PathBuf::from("session-history"))
+                .count(),
+            2
+        );
+    }
 
     struct MockCommandLaunchHarness {
         _guard: MutexGuard<'static, ()>,
@@ -2281,7 +2657,30 @@ mod tests {
             LaunchArgs {
                 preset_ref: Some("daily".to_string()),
                 session_ref: None,
+                handoff_ref: None,
                 passthrough_args: vec!["--model".to_string(), "sonnet".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn parse_launch_args_accepts_saved_handoff_selection() {
+        let parsed = parse_launch_args(vec![
+            "--handoff".to_string(),
+            ".ctx/vault/contexts/session-history/codex-1.md".to_string(),
+            "--".to_string(),
+            "--sandbox".to_string(),
+            "workspace-write".to_string(),
+        ])
+        .expect("launch args should accept saved handoff paths");
+
+        assert_eq!(
+            parsed,
+            LaunchArgs {
+                preset_ref: None,
+                session_ref: None,
+                handoff_ref: Some(".ctx/vault/contexts/session-history/codex-1.md".to_string()),
+                passthrough_args: vec!["--sandbox".to_string(), "workspace-write".to_string()]
             }
         );
     }
@@ -2399,6 +2798,141 @@ mod tests {
         assert!(error.contains("failed to resolve Codex CLI"));
         assert!(error.contains("executable 'codex' was not found on PATH"));
         assert!(error.contains(CTX_CODEX_BIN_ENV));
+    }
+
+    #[test]
+    fn list_codex_sessions_enumerates_default_session_log_path() {
+        let home = temp_workspace();
+        let workspace = temp_workspace();
+        let codex_session_dir = home.join(".codex").join("sessions").join("2026").join("05");
+        fs::create_dir_all(&codex_session_dir).expect("Codex session log dir should be created");
+        let log_path = codex_session_dir.join("codex-session-123.jsonl");
+        fs::write(
+            &log_path,
+            r#"{"type":"session_meta","timestamp":"2026-05-10T12:00:00Z","payload":{"id":"codex-session-123","cwd":"/workspace/app","timestamp":"2026-05-10T12:00:00Z"}}
+{"type":"event_msg","timestamp":"2026-05-10T12:01:00Z","payload":{"type":"user_message","message":"Implement session handoff scanning"}}"#,
+        )
+        .expect("Codex session log should be writable");
+
+        with_home(&home, || {
+            let sessions = list_codex_sessions(&home, &workspace)
+                .expect("readable Codex session logs should enumerate");
+
+            assert_eq!(sessions.len(), 1);
+            let session = &sessions[0];
+            assert_eq!(session.provider, "codex");
+            assert_eq!(session.session_id, "codex-session-123");
+            assert_eq!(session.updated_at.as_deref(), Some("2026-05-10T12:00:00Z"));
+            assert_eq!(session.cwd.as_deref(), Some("/workspace/app"));
+            assert_eq!(
+                session
+                    .file_path
+                    .canonicalize()
+                    .expect("enumerated log path should canonicalize"),
+                log_path
+                    .canonicalize()
+                    .expect("expected log path should canonicalize")
+            );
+            assert_eq!(session.message_count, 1);
+            assert_eq!(session.title, "Implement session handoff scanning");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_codex_sessions_skips_missing_and_unreadable_log_locations() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = temp_workspace();
+        let workspace = temp_workspace();
+        let vault_root = workspace.join(".ctx").join("vault");
+        let codex_session_dir = home.join(".codex").join("sessions").join("2026").join("05");
+        let unreadable_configured_root = workspace.join("unreadable-codex");
+        let unreadable_nested_dir = home
+            .join(".codex")
+            .join("sessions")
+            .join("unreadable-nested");
+        fs::create_dir_all(&vault_root).expect("local vault root should be created");
+        fs::create_dir_all(&codex_session_dir).expect("Codex session log dir should be created");
+        fs::create_dir_all(&unreadable_configured_root)
+            .expect("unreadable configured root should be created");
+        fs::create_dir_all(&unreadable_nested_dir)
+            .expect("unreadable nested dir should be created");
+        fs::write(
+            ctx_core::vault_settings_path(&vault_root),
+            r#"{"codex_session_roots":["missing-codex","unreadable-codex"]}"#,
+        )
+        .expect("local settings should be writable");
+        let log_path = codex_session_dir.join("codex-session-readable.jsonl");
+        fs::write(
+            &log_path,
+            r#"{"type":"session_meta","timestamp":"2026-05-10T12:00:00Z","payload":{"id":"codex-session-readable","cwd":"/workspace/app","timestamp":"2026-05-10T12:00:00Z"}}"#,
+        )
+        .expect("readable Codex session log should be writable");
+
+        let original_configured_permissions = fs::metadata(&unreadable_configured_root)
+            .expect("configured root metadata should be readable")
+            .permissions();
+        let original_nested_permissions = fs::metadata(&unreadable_nested_dir)
+            .expect("nested root metadata should be readable")
+            .permissions();
+        fs::set_permissions(
+            &unreadable_configured_root,
+            fs::Permissions::from_mode(0o000),
+        )
+        .expect("configured root should be made unreadable");
+        fs::set_permissions(&unreadable_nested_dir, fs::Permissions::from_mode(0o000))
+            .expect("nested root should be made unreadable");
+
+        let sessions = with_home(&home, || {
+            list_codex_sessions(&home, &workspace)
+                .expect("missing and unreadable Codex log locations should be skipped")
+        });
+
+        fs::set_permissions(&unreadable_configured_root, original_configured_permissions)
+            .expect("configured root permissions should be restored");
+        fs::set_permissions(&unreadable_nested_dir, original_nested_permissions)
+            .expect("nested root permissions should be restored");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "codex-session-readable");
+    }
+
+    #[test]
+    fn list_claude_sessions_enumerates_readable_log_files_with_basic_metadata() {
+        let home = temp_workspace();
+        let workspace = temp_workspace();
+        let claude_project_dir = home.join(".claude").join("projects").join("workspace-app");
+        fs::create_dir_all(&claude_project_dir).expect("Claude project log dir should be created");
+        let log_path = claude_project_dir.join("metadata-only.jsonl");
+        fs::write(
+            &log_path,
+            r#"{"type":"system","sessionId":"claude-session-123","cwd":"/workspace/app","timestamp":"2026-05-10T12:00:00Z"}"#,
+        )
+        .expect("Claude session log should be writable");
+
+        with_home(&home, || {
+            let sessions = list_claude_sessions(&home, &workspace)
+                .expect("readable Claude session logs should enumerate");
+
+            assert_eq!(sessions.len(), 1);
+            let session = &sessions[0];
+            assert_eq!(session.provider, "claude");
+            assert_eq!(session.session_id, "claude-session-123");
+            assert_eq!(session.updated_at.as_deref(), Some("2026-05-10T12:00:00Z"));
+            assert_eq!(session.cwd.as_deref(), Some("/workspace/app"));
+            assert_eq!(
+                session
+                    .file_path
+                    .canonicalize()
+                    .expect("enumerated log path should canonicalize"),
+                log_path
+                    .canonicalize()
+                    .expect("expected log path should canonicalize")
+            );
+            assert_eq!(session.message_count, 0);
+            assert_eq!(session.title, "Claude session");
+        });
     }
 
     #[test]
@@ -2906,6 +3440,7 @@ mod tests {
             LaunchArgs {
                 preset_ref: Some("delegated-review".to_string()),
                 session_ref: None,
+                handoff_ref: None,
                 passthrough_args: vec!["--sandbox".to_string(), "workspace-write".to_string()],
             },
         )
@@ -2971,6 +3506,7 @@ mod tests {
             LaunchArgs {
                 preset_ref: Some("claude-selected".to_string()),
                 session_ref: None,
+                handoff_ref: None,
                 passthrough_args: Vec::new(),
             },
         )
@@ -2987,6 +3523,172 @@ mod tests {
         assert!(prompt.contains(&selected.file_path.display().to_string()));
         assert!(!prompt.contains("This file is not in the preset."));
         assert!(!prompt.contains(&ignored.file_path.display().to_string()));
+    }
+
+    #[test]
+    fn launch_session_selection_preserves_classified_handoff_context() {
+        let harness = MockCommandLaunchHarness::new();
+        let session_id = "codex-classified-selection";
+        let session_dir = harness
+            .home()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05");
+        fs::create_dir_all(&session_dir).expect("Codex session log dir should be created");
+        fs::write(
+            session_dir.join(format!("{session_id}.jsonl")),
+            format!(
+                r#"{{"type":"session_meta","timestamp":"2026-05-11T00:00:00Z","payload":{{"id":"{session_id}","cwd":"{}","timestamp":"2026-05-11T00:00:00Z"}}}}
+{{"type":"event_msg","timestamp":"2026-05-11T00:01:00Z","payload":{{"type":"user_message","message":"Implement session launch handoff selection"}}}}
+{{"type":"event_msg","timestamp":"2026-05-11T00:02:00Z","payload":{{"type":"agent_message","message":"Summary: Implemented launch handoff selection for prior sessions.\nDecision: Preserve work-context classification when a scanned session is selected for launch.\nChanged files: crates/ctx-cli/src/bin/ctx.rs.\nVerified with cargo test -p ctx-cli launch_session_selection_preserves_classified_handoff_context.\nRemaining work: run full CLI tests."}}}}"#,
+                harness.workspace().display()
+            ),
+        )
+        .expect("Codex session log should be writable");
+
+        let startup = orchestrate_wrapper_startup(
+            CliTarget::Claude,
+            harness.workspace(),
+            LaunchArgs {
+                preset_ref: None,
+                session_ref: Some(session_id.to_string()),
+                handoff_ref: None,
+                passthrough_args: Vec::new(),
+            },
+        )
+        .expect("wrapper startup should classify and select the session handoff context");
+
+        assert_eq!(startup.contexts.len(), 1);
+        assert_eq!(
+            startup.preset.preset_contexts,
+            vec![startup.contexts[0].context_id]
+        );
+        let metadata = startup.contexts[0]
+            .session_handoff_classification
+            .as_ref()
+            .expect("selected session should retain handoff classification metadata");
+        assert_eq!(metadata.source_tool, "codex");
+        assert_eq!(metadata.source_session_ref, session_id);
+        assert_eq!(
+            metadata.source_working_directory,
+            harness.workspace().display().to_string()
+        );
+        assert_eq!(
+            metadata.work_context_classification_status,
+            ClassificationStatus::Classified
+        );
+        assert!(!metadata.work_context_categories.is_empty());
+
+        let plan = build_claude_launch_plan(startup)
+            .expect("Claude launch plan should include selected session context");
+        let prompt =
+            fs::read_to_string(plan.prompt_file.path()).expect("prompt file should be readable");
+
+        assert!(prompt.contains("# CTX Claude Session Context"));
+        assert!(prompt.contains("Implement session launch handoff selection"));
+        assert!(prompt.contains("source_tool: codex"));
+        assert!(prompt.contains(&format!("source_session_ref: \"{session_id}\"")));
+        assert!(prompt.contains("work_context_category: "));
+        assert!(prompt.contains("work_context_categories: ["));
+        assert!(prompt.contains("work_context_classification_status: classified"));
+        assert!(prompt.contains("Preserve work-context classification"));
+        assert!(prompt.contains("crates/ctx-cli/src/bin/ctx.rs"));
+    }
+
+    #[test]
+    fn claude_launch_plan_preserves_selected_saved_handoff_markdown() {
+        let workspace = temp_workspace();
+        let roots = VaultRoots::discover(&workspace);
+        let body = "# Previous Session Context\n\n## Handoff Summary\n\nSaved handoff launch selection is preserved. Saved Claude handoff body must survive target launch selection.\n\n### Goals\n\n- Preserve selected saved handoff context.\n\n### Key changed files\n\n- crates/ctx-cli/src/bin/ctx.rs\n\n### Commands\n\n- cargo test -p ctx-cli\n\n### Decisions\n\n- Use the saved handoff markdown, not regenerated scan output.\n\n### Verification results\n\n- cargo test -p ctx-cli claude_launch_plan_preserves_selected_saved_handoff_markdown\n\n### Remaining work\n\n- Launch the selected saved context.";
+        let handoff = saved_handoff_context(CliTarget::Claude, body);
+        let saved = create_session_handoff_context_file(
+            &roots,
+            VaultScope::Local,
+            PathBuf::from("session-history"),
+            "claude-selected-handoff.md",
+            &handoff,
+        )
+        .expect("saved Claude handoff should be persisted");
+
+        let startup = orchestrate_wrapper_startup(
+            CliTarget::Claude,
+            &workspace,
+            LaunchArgs {
+                preset_ref: None,
+                session_ref: None,
+                handoff_ref: Some(saved.fragment.file_path.display().to_string()),
+                passthrough_args: Vec::new(),
+            },
+        )
+        .expect("wrapper startup should select the saved handoff context");
+        assert_eq!(startup.contexts[0].content, body);
+
+        let plan = build_claude_launch_plan(startup)
+            .expect("Claude launch plan should include selected saved handoff");
+        let prompt =
+            fs::read_to_string(plan.prompt_file.path()).expect("prompt file should be readable");
+
+        assert!(prompt.contains("# CTX Claude Session Context"));
+        assert!(prompt.contains("Saved Claude handoff body must survive target launch selection."));
+        assert!(prompt.contains("Use the saved handoff markdown, not regenerated scan output."));
+        assert!(prompt.contains(&saved.fragment.file_path.display().to_string()));
+        assert!(
+            !prompt.contains("session_handoff_format_version"),
+            "launch should inject the selected handoff body, not saved frontmatter"
+        );
+    }
+
+    #[test]
+    fn codex_launch_plan_preserves_selected_saved_handoff_markdown() {
+        let workspace = temp_workspace();
+        let roots = VaultRoots::discover(&workspace);
+        let body = "# Previous Session Context\n\n## Handoff Summary\n\nSaved handoff launch selection is preserved. Saved Codex handoff body must be visible through AGENTS.md injection.\n\n### Goals\n\n- Preserve selected saved handoff context.\n\n### Key changed files\n\n- crates/ctx-cli/src/bin/ctx.rs\n\n### Commands\n\n- cargo test -p ctx-cli\n\n### Decisions\n\n- Use the saved handoff markdown, not regenerated scan output.\n- Inject the selected saved handoff as the managed block payload.\n\n### Verification results\n\n- cargo test -p ctx-cli codex_launch_plan_preserves_selected_saved_handoff_markdown\n\n### Remaining work\n\n- Launch the selected saved context.\n- Clean up the managed block after exit.";
+        let handoff = saved_handoff_context(CliTarget::Codex, body);
+        let saved = create_session_handoff_context_file(
+            &roots,
+            VaultScope::Local,
+            PathBuf::from("session-history"),
+            "codex-selected-handoff.md",
+            &handoff,
+        )
+        .expect("saved Codex handoff should be persisted");
+
+        let startup = orchestrate_wrapper_startup(
+            CliTarget::Codex,
+            &workspace,
+            LaunchArgs {
+                preset_ref: None,
+                session_ref: None,
+                handoff_ref: Some(saved.fragment.file_path.display().to_string()),
+                passthrough_args: Vec::new(),
+            },
+        )
+        .expect("wrapper startup should select the saved handoff context");
+        assert_eq!(startup.contexts[0].content, body);
+
+        let plan = build_codex_launch_plan(startup)
+            .expect("Codex launch plan should inject selected saved handoff");
+        let agents_md = fs::read_to_string(workspace.join(AGENTS_MD_FILE_NAME))
+            .expect("AGENTS.md should be readable after injection");
+
+        assert!(agents_md.contains(CTX_START_MARKER));
+        assert!(agents_md.contains("# CTX Codex Session Context"));
+        assert!(agents_md
+            .contains("Saved Codex handoff body must be visible through AGENTS.md injection."));
+        assert!(
+            agents_md.contains("Inject the selected saved handoff as the managed block payload.")
+        );
+        assert!(agents_md.contains(&saved.fragment.file_path.display().to_string()));
+        assert!(
+            !agents_md.contains("session_handoff_format_version"),
+            "launch should inject the selected handoff body, not saved frontmatter"
+        );
+        drop(plan);
+        assert!(
+            !workspace.join(AGENTS_MD_FILE_NAME).exists(),
+            "dropping the plan should clean the temporary managed block"
+        );
     }
 
     #[test]
@@ -3017,6 +3719,7 @@ mod tests {
             LaunchArgs {
                 preset_ref: Some("oversized-delegation".to_string()),
                 session_ref: None,
+                handoff_ref: None,
                 passthrough_args: Vec::new(),
             },
         )
@@ -3101,6 +3804,7 @@ mod tests {
             import_source: None,
             import_source_type: None,
             llm_classification_status: ClassificationStatus::Reviewed,
+            session_handoff_classification: None,
         };
         let preset = Preset {
             preset_id: Uuid::new_v4(),
@@ -3440,7 +4144,10 @@ mod tests {
         let error = run_wrapped_claude_session(plan)
             .expect_err("missing Claude executable should be reported");
 
-        assert!(error.contains("failed to launch Claude CLI"));
+        assert!(error.contains("Launch failed: Claude CLI did not start."));
+        assert!(error.contains("Injection method: temporary prompt file"));
+        assert!(error.contains("Next step: verify Claude is installed and executable"));
+        assert!(error.contains(CTX_CLAUDE_BIN_ENV));
         assert!(error.contains("--append-system-prompt-file"));
         assert!(error.contains(&missing_program.display().to_string()));
         assert!(error.contains(&workspace.display().to_string()));
@@ -3758,7 +4465,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_launch_plan_cleans_residual_managed_agents_md_markers_before_injection() {
+    fn codex_launch_plan_replaces_existing_managed_agents_md_block_in_place() {
         let workspace = temp_workspace();
         let agents_md = workspace.join(AGENTS_MD_FILE_NAME);
         fs::write(
@@ -3781,20 +4488,33 @@ mod tests {
         };
 
         let plan = build_codex_launch_plan(orchestration(preset, vec![context], Vec::new()))
-            .expect("valid residual managed markers should be cleaned before launch planning");
+            .expect("valid existing managed block should be replaced during launch planning");
         let agents_content =
             fs::read_to_string(&agents_md).expect("AGENTS.md should contain fresh injection");
+        let project_rules_index = agents_content
+            .find("# Existing Project Rules")
+            .expect("prefix should remain");
+        let fresh_context_index = agents_content
+            .find("Use fresh context.")
+            .expect("fresh context should be injected");
+        let manual_rule_index = agents_content
+            .find("Manual project rule.")
+            .expect("suffix should remain");
 
         assert!(agents_content.contains("# Existing Project Rules"));
         assert!(agents_content.contains("Manual project rule."));
         assert!(!agents_content.contains("Old ctx block"));
         assert!(agents_content.contains("Use fresh context."));
+        assert!(project_rules_index < fresh_context_index);
+        assert!(fresh_context_index < manual_rule_index);
+        assert_eq!(agents_content.matches(CTX_START_MARKER).count(), 1);
+        assert_eq!(agents_content.matches(CTX_END_MARKER).count(), 1);
 
         drop(plan);
     }
 
     #[test]
-    fn codex_launch_plan_refuses_startup_when_residual_marker_cleanup_fails() {
+    fn codex_launch_plan_refuses_startup_when_managed_markers_are_malformed() {
         let workspace = temp_workspace();
         let agents_md = workspace.join(AGENTS_MD_FILE_NAME);
         fs::write(
@@ -3821,10 +4541,11 @@ mod tests {
         let agents_content =
             fs::read_to_string(&agents_md).expect("AGENTS.md should remain readable");
 
-        assert!(error.contains("refusing to launch Codex"));
-        assert!(error.contains("residual ctx marker cleanup failed"));
-        assert!(error.contains("<!-- [ctx:start] -->"));
-        assert!(error.contains("<!-- [ctx:end] -->"));
+        assert!(error.contains("Cannot launch Codex"));
+        assert!(error.contains("managed AGENTS.md context block"));
+        assert!(error.contains("Safety: AGENTS.md was not overwritten."));
+        assert!(error.contains("Next step: fix malformed or duplicate ctx managed markers"));
+        assert!(error.contains("found start marker without end marker"));
         assert!(agents_content.contains("Malformed stale ctx block"));
         assert!(!agents_content.contains("Use fresh context."));
     }
@@ -3866,7 +4587,10 @@ mod tests {
         let agents_content =
             fs::read_to_string(&agents_md).expect("AGENTS.md should remain readable");
 
-        assert!(error.contains("refusing to launch Codex"));
+        assert!(error.contains("Cannot launch Codex"));
+        assert!(error.contains("managed AGENTS.md context block"));
+        assert!(error.contains("Safety: AGENTS.md was not overwritten."));
+        assert!(error.contains("Next step: fix malformed or duplicate ctx managed markers"));
         assert!(error.contains("found multiple sections"));
         assert!(agents_content.contains("First stale ctx block"));
         assert!(agents_content.contains("Second stale ctx block"));
@@ -4014,7 +4738,8 @@ mod tests {
         let launch_result = launch_codex(LaunchArgs {
             preset_ref: Some("codex-real-wrapper".to_string()),
             session_ref: None,
-                passthrough_args: vec!["--sandbox".to_string(), "workspace-write".to_string()],
+            handoff_ref: None,
+            passthrough_args: vec!["--sandbox".to_string(), "workspace-write".to_string()],
         });
 
         env::set_current_dir(previous_dir).expect("test cwd should be restored");
@@ -4108,7 +4833,8 @@ mod tests {
         let launch_result = launch_claude(LaunchArgs {
             preset_ref: Some("claude-real-wrapper".to_string()),
             session_ref: None,
-                passthrough_args: vec!["--debug".to_string(), "--print".to_string()],
+            handoff_ref: None,
+            passthrough_args: vec!["--debug".to_string(), "--print".to_string()],
         });
 
         env::set_current_dir(previous_dir).expect("test cwd should be restored");
@@ -4219,7 +4945,11 @@ mod tests {
         let error = run_wrapped_codex_session(plan)
             .expect_err("Codex child spawn errors should be returned to the wrapper caller");
 
-        assert!(error.contains("failed to launch Codex CLI with managed AGENTS.md"));
+        assert!(error.contains("Launch failed: Codex CLI did not start."));
+        assert!(error.contains("Injection method: managed ctx block in AGENTS.md."));
+        assert!(error.contains("Cleanup: the managed ctx block will be removed automatically"));
+        assert!(error.contains("Next step: verify Codex is installed and executable"));
+        assert!(error.contains(CTX_CODEX_BIN_ENV));
         assert!(error.contains(&missing_codex.display().to_string()));
         assert!(
             !workspace.join(AGENTS_MD_FILE_NAME).exists(),
@@ -4409,6 +5139,47 @@ mod tests {
             import_source: None,
             import_source_type: None,
             llm_classification_status: ClassificationStatus::Reviewed,
+            session_handoff_classification: None,
+        }
+    }
+
+    fn saved_handoff_context(target: CliTarget, handoff_markdown: &str) -> SessionHandoffContext {
+        let injection_method = match target {
+            CliTarget::Claude => InjectionStrategy::AppendSystemPromptFile,
+            CliTarget::Codex => InjectionStrategy::AgentsMdSectionMarkerMerge,
+        };
+
+        SessionHandoffContext {
+            source_tool: SessionLogProvider::Codex,
+            source_session_ref: "saved-launch-selection-1".to_string(),
+            source_working_directory: "/workspace/saved-launch".to_string(),
+            source_log_path: "/workspace/saved-launch/session.jsonl".to_string(),
+            source_updated_at: Some("2026-05-11T00:00:00Z".to_string()),
+            title: "Saved launch selection".to_string(),
+            category: WorkContextCategory::Implementation,
+            categories: vec![
+                WorkContextCategory::Implementation,
+                WorkContextCategory::Launch,
+            ],
+            classification_status: ClassificationStatus::Reviewed,
+            classification_confidence_score: 92,
+            classification_rationale: "Saved session handoff is ready for launch.".to_string(),
+            goals: vec!["Preserve selected saved handoff context.".to_string()],
+            summary: "Saved handoff launch selection is preserved.".to_string(),
+            key_changed_files: vec!["crates/ctx-cli/src/bin/ctx.rs".to_string()],
+            commands: vec!["cargo test -p ctx-cli".to_string()],
+            decisions: vec![
+                "Use the saved handoff markdown, not regenerated scan output.".to_string(),
+            ],
+            verification_results: vec!["cargo test -p ctx-cli".to_string()],
+            remaining_work: vec!["Launch the selected saved context.".to_string()],
+            created_at: "2026-05-11T00:01:00Z".to_string(),
+            handoff_markdown: handoff_markdown.to_string(),
+            tags: vec!["session-history".to_string(), "resume-context".to_string()],
+            cleanup_applied: true,
+            refine_mode: WorkContextRefineMode::Refined,
+            launch_target: target,
+            injection_method,
         }
     }
 
@@ -4418,17 +5189,18 @@ mod tests {
         workspace
     }
 
-    fn with_home(home: &Path, test: impl FnOnce()) {
+    fn with_home<T>(home: &Path, test: impl FnOnce() -> T) -> T {
         let _guard = HOME_ENV_LOCK
             .lock()
             .expect("HOME env lock should not be poisoned");
         let previous_home = env::var_os("HOME");
         env::set_var("HOME", home);
-        test();
+        let output = test();
         match previous_home {
             Some(value) => env::set_var("HOME", value),
             None => env::remove_var("HOME"),
         }
+        output
     }
 
     fn json_file_count(path: &Path) -> usize {

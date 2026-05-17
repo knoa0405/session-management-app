@@ -9,10 +9,12 @@ pub mod classification;
 pub mod injection;
 pub mod models;
 pub mod presets;
+pub mod session_logs;
 pub mod settings;
 pub mod sqlite_index;
 pub mod vault;
 pub mod watch;
+pub mod work_context;
 
 use std::path::Path;
 
@@ -38,13 +40,15 @@ pub use injection::{
     cleanup_codex_agents_md, cleanup_residual_codex_agents_md_markers, cleanup_stale_wrapper_state,
     cleanup_transient_wrapper_artifacts, default_wrapper_state_dir,
     detect_residual_codex_agents_md_markers, inject_codex_agents_md, injection_strategy,
-    remove_agents_md_managed_section, remove_transient_wrapper_state_file,
-    replace_agents_md_managed_section, resolve_preset_context_items,
-    resolve_subagent_context_items, wrapper_state_path, write_transient_wrapper_state,
+    locate_agents_md_managed_section, remove_agents_md_managed_section,
+    remove_transient_wrapper_state_file, replace_agents_md_managed_section,
+    resolve_preset_context_items, resolve_subagent_context_items, wrapper_state_path,
+    write_claude_handoff_prompt_file, write_transient_wrapper_state, AgentsMdManagedSection,
     ClaudePromptFile, CodexAgentsMdInjection, CodexInjectionError, CodexResidualMarkers,
     ContextItemResolveError, ContextRenderOptions, PromptAssemblyError, SectionReplaceError,
     SubagentContextResolveError, TransientWrapperState, WrapperStateCleanupReport,
-    WrapperStateError, AGENTS_MD_FILE_NAME, COMBINED_CONTEXT_ITEM_SEPARATOR, CTX_END_MARKER,
+    WrapperStateError, AGENTS_MD_FILE_NAME, AGENTS_MD_MANAGED_BLOCK_END_MARKER,
+    AGENTS_MD_MANAGED_BLOCK_START_MARKER, COMBINED_CONTEXT_ITEM_SEPARATOR, CTX_END_MARKER,
     CTX_START_MARKER, WRAPPER_STATE_DIR_NAME,
 };
 pub use models::{
@@ -52,9 +56,10 @@ pub use models::{
     ContextDiscoveryMetadata, ContextDiscoveryResult, ContextFragment, HandoffConstraints,
     ImportSourceType, InjectionMarkers, InjectionStrategy, Preset, PresetContextComposition,
     PresetContextSelection, PresetContextSelectionInput, PresetContextSelectionKind,
-    PresetExecutionSettingsUpdate, PresetMetadata, ResolvedContextItem, SessionRecord,
-    SessionStatus, SubagentManifest, SubagentManifestUpdate, SubagentRole, SubagentSpawnGuidance,
-    VaultEntryKey, VaultScope, WrapperBehavior,
+    PresetExecutionSettingsUpdate, PresetMetadata, ResolvedContextItem,
+    SessionHandoffClassificationMetadata, SessionRecord, SessionStatus, SubagentManifest,
+    SubagentManifestUpdate, SubagentRole, SubagentSpawnGuidance, VaultEntryKey, VaultScope,
+    WrapperBehavior,
 };
 pub use presets::{
     list_presets_from_resolved_overlay, load_preset_from_resolved_overlay, managed_presets_dir,
@@ -62,10 +67,19 @@ pub use presets::{
     validate_cli_execution_settings, validate_subagent_manifest, LoadedPreset, PresetLoadError,
     PresetSummary, MANAGED_PRESETS_DIR, MAX_SUBAGENT_MANIFEST_JSON_BYTES,
 };
+pub use session_logs::{
+    enumerate_claude_session_log_paths, parse_claude_session_log_detail,
+    parse_codex_session_log_detail, ClaudeSessionLogScanner, CodexSessionIndexEntry,
+    CodexSessionLogScanner, SessionLogDetail, SessionLogEventRecord, SessionLogMessage,
+    SessionLogMetadata, SessionLogProvider, SessionLogScanError, SessionLogScanErrorKind,
+    SessionLogScanRequest, SessionLogScanResult, SessionLogScanner,
+};
 pub use settings::{
     load_configured_scan_roots, load_configured_skill_scan_roots, load_vault_settings_overlay,
-    vault_settings_path, ConfiguredScanRoot, ResolvedVaultSettings, ScanRootConfig, VaultSettings,
-    VaultSettingsError, VaultSettingsSource, VAULT_SETTINGS_FILE_NAME,
+    resolve_claude_session_log_roots, resolve_codex_session_log_roots, vault_settings_path,
+    ConfiguredScanRoot, ResolvedSessionLogRoot, ResolvedVaultSettings, ScanRootConfig,
+    SessionLogRootSource, VaultSettings, VaultSettingsError, VaultSettingsSource,
+    VAULT_SETTINGS_FILE_NAME,
 };
 pub use sqlite_index::{
     apply_sqlite_index_migrations, apply_sqlite_index_migrations_to_connection,
@@ -104,25 +118,47 @@ pub use sqlite_index::{
     TAGS_TABLE_NAME,
 };
 pub use vault::{
-    canonical_vault_entry_key, create_context_file, delete_markdown_context_file,
-    delete_resolved_context_markdown, discover_existing_context_file_results,
-    discover_existing_context_files, discover_global_vault_path, discover_project_local_vault_path,
-    initialize_global_vault, initialize_project_local_vault, list_context_files,
-    list_context_files_with_discovered, lookup_markdown_context_index,
-    lookup_markdown_contexts_by_tag, managed_contexts_dir, materialize_discovered_context_file,
+    canonical_vault_entry_key, create_context_file, create_session_handoff_context_file,
+    delete_markdown_context_file, delete_resolved_context_markdown,
+    discover_existing_context_file_results, discover_existing_context_files,
+    discover_global_vault_path, discover_project_local_vault_path, initialize_global_vault,
+    initialize_project_local_vault, list_context_files, list_context_files_with_discovered,
+    list_session_handoff_contexts, lookup_markdown_context_index, lookup_markdown_contexts_by_tag,
+    managed_contexts_dir, materialize_discovered_context_file,
     materialize_discovered_context_files, read_markdown_context_file,
-    read_resolved_context_markdown, reindex_markdown_contexts, resolve_overlay,
-    resolve_overlay_vault, review_import_classification, sync_markdown_context_index_event,
+    read_resolved_context_fragment, read_resolved_context_markdown,
+    read_resolved_session_handoff_context, read_session_handoff_context_file,
+    reindex_markdown_contexts, resolve_overlay, resolve_overlay_vault,
+    review_import_classification, sync_markdown_context_index_event,
     sync_markdown_context_index_events, update_markdown_context_file,
-    update_resolved_context_markdown, GlobalVaultInitialization, OverlayMarkdownIndexLookup,
-    ProjectLocalVaultInitialization, ResolvedOverlayVault, VaultError, VaultReindexReport,
-    VaultRoots, CTX_HOME_DIR, GLOBAL_VAULT_DIR,
+    update_resolved_context_markdown, update_session_handoff_context_file,
+    GlobalVaultInitialization, OverlayMarkdownIndexLookup, ProjectLocalVaultInitialization,
+    ResolvedOverlayVault, SavedSessionHandoffContext, VaultError, VaultReindexReport, VaultRoots,
+    CTX_HOME_DIR, GLOBAL_VAULT_DIR,
 };
 pub use watch::{
     configured_context_watch_roots, diff_context_file_snapshots, snapshot_context_directories,
     watch_context_directories, ContextDirectoryWatcher, ContextFileChangeEvent,
     ContextFileChangeKind, ContextFileSnapshot, ContextFileSnapshotEntry, ContextWatchError,
     ContextWatchRoot, ContextWatchRootKind,
+};
+pub use work_context::{
+    classify_work_context_detail, classify_work_context_signals,
+    extract_distilled_session_handoff_fields, extract_work_context_signals,
+    filter_work_relevant_content, filter_work_relevant_signals, injection_method_for_launch_target,
+    work_context_category_definition, DistilledSessionHandoffFields, SessionHandoffContext,
+    SessionHandoffContextFieldDefinition, WorkContextCategory, WorkContextCategoryDefinition,
+    WorkContextClassificationResult, WorkContextFilterReason, WorkContextFilteredContent,
+    WorkContextFilteredRecord, WorkContextRefineMode, WorkContextSchemaError, WorkContextSignal,
+    WorkContextSignalCounts, WorkContextSignalEvidence, WorkContextSignalKind,
+    WorkContextSignalSet, MAX_HANDOFF_CHANGED_FILES, MAX_HANDOFF_COMMANDS, MAX_HANDOFF_DECISIONS,
+    MAX_HANDOFF_GOALS, MAX_HANDOFF_MARKDOWN_CHARS, MAX_HANDOFF_MARKDOWN_LINES,
+    MAX_HANDOFF_REMAINING_WORK, MAX_HANDOFF_SIGNAL_CHARS, MAX_HANDOFF_SUMMARY_CHARS,
+    MAX_HANDOFF_VERIFICATION_RESULTS, SESSION_HANDOFF_CONTEXT_MVP_SCHEMA,
+    SESSION_HANDOFF_CONTEXT_OUTPUT_FORMAT_VERSION,
+    SESSION_HANDOFF_CONTEXT_REQUIRED_FRONTMATTER_FIELDS,
+    SESSION_HANDOFF_CONTEXT_REQUIRED_MVP_FIELDS, WORK_CONTEXT_CATEGORY_TAXONOMY,
+    WORK_CONTEXT_CLASSIFICATION_OUTPUT_FORMAT_VERSION,
 };
 
 pub const APP_NAME: &str = "ctx";

@@ -2,8 +2,8 @@ use super::{
     classify_discovered_context, classify_import_markdown_content, Classification,
     ClassificationStatus, ContextDiscoveryMetadata, ContextDiscoveryResult, ContextFragment,
     DiscoveredContextClassificationMetadata, ImportSourceType, ImportTimeClassificationRequest,
-    VaultEntryKey, VaultScope, MAIN_AGENT_DIRECTORY_PATTERNS, MAIN_AGENT_FILE_NAMES,
-    SKILL_DIRECTORY_PATTERNS, SUBAGENT_DIRECTORY_PATTERNS,
+    SessionHandoffClassificationMetadata, VaultEntryKey, VaultScope, MAIN_AGENT_DIRECTORY_PATTERNS,
+    MAIN_AGENT_FILE_NAMES, SKILL_DIRECTORY_PATTERNS, SUBAGENT_DIRECTORY_PATTERNS,
 };
 use crate::settings::{load_configured_scan_roots, load_configured_skill_scan_roots};
 use crate::sqlite_index::{
@@ -17,6 +17,7 @@ use crate::sqlite_index::{
     MarkdownFileTagSource, ParsedFrontmatterMetadata, SqliteIndexMigrationReport,
 };
 use crate::watch::{ContextFileChangeEvent, ContextFileChangeKind, ContextWatchRootKind};
+use crate::work_context::{SessionHandoffContext, WorkContextSchemaError};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -106,6 +107,12 @@ pub struct VaultReindexReport {
     pub global: FullMarkdownReindexReport,
     pub local: Option<FullMarkdownReindexReport>,
     pub discovered_markdown_files: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedSessionHandoffContext {
+    pub fragment: ContextFragment,
+    pub handoff: SessionHandoffContext,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -215,6 +222,7 @@ pub enum VaultError {
     MissingContext(PathBuf),
     Io(String),
     Index(String),
+    Schema(String),
 }
 
 impl fmt::Display for VaultError {
@@ -242,6 +250,7 @@ impl fmt::Display for VaultError {
             }
             Self::Io(message) => write!(formatter, "{message}"),
             Self::Index(message) => write!(formatter, "{message}"),
+            Self::Schema(message) => write!(formatter, "{message}"),
         }
     }
 }
@@ -307,23 +316,85 @@ pub fn create_context_file(
         ))
     })?;
 
+    let saved_metadata = saved_context_classification_metadata(content);
+
     Ok(ContextFragment {
         context_id: Uuid::new_v4(),
         title: context_title(file_name),
         content: content.to_string(),
         file_path: target_path,
         vault_scope: scope,
-        classification: Classification::Shared,
+        classification: saved_metadata
+            .classification
+            .unwrap_or(Classification::Shared),
         import_classification_suggestion: None,
-        inferred_classification: None,
-        tags: Vec::new(),
+        inferred_classification: saved_metadata.classification,
+        tags: saved_metadata.tags,
         folder_path,
         wikilinks: extract_wikilinks(content),
         backlinks: Vec::new(),
         import_source: None,
         import_source_type: None,
-        llm_classification_status: ClassificationStatus::Pending,
+        llm_classification_status: saved_metadata
+            .llm_classification_status
+            .unwrap_or(ClassificationStatus::Pending),
+        session_handoff_classification: saved_metadata.session_handoff_classification,
     })
+}
+
+pub fn create_session_handoff_context_file(
+    roots: &VaultRoots,
+    scope: VaultScope,
+    folder_path: impl AsRef<Path>,
+    file_name: &str,
+    handoff: &SessionHandoffContext,
+) -> Result<SavedSessionHandoffContext, VaultError> {
+    let content = handoff.to_saved_markdown().map_err(schema_error)?;
+    let fragment = create_context_file(roots, scope, folder_path, file_name, &content)?;
+    let persisted =
+        SessionHandoffContext::from_saved_markdown(&fragment.content).map_err(schema_error)?;
+
+    Ok(SavedSessionHandoffContext {
+        fragment,
+        handoff: persisted,
+    })
+}
+
+pub fn update_session_handoff_context_file(
+    path: &Path,
+    handoff: &SessionHandoffContext,
+) -> Result<SessionHandoffContext, VaultError> {
+    let content = handoff.to_saved_markdown().map_err(schema_error)?;
+    update_markdown_context_file(path, &content)?;
+    read_session_handoff_context_file(path)
+}
+
+pub fn read_session_handoff_context_file(path: &Path) -> Result<SessionHandoffContext, VaultError> {
+    let content = read_markdown_context_file(path)?;
+    SessionHandoffContext::from_saved_markdown(&content).map_err(schema_error)
+}
+
+pub fn list_session_handoff_contexts(
+    roots: &VaultRoots,
+) -> Result<Vec<SavedSessionHandoffContext>, VaultError> {
+    let mut saved = Vec::new();
+
+    for fragment in list_context_files(roots)? {
+        if !is_session_handoff_fragment(&fragment) {
+            continue;
+        }
+        let handoff =
+            SessionHandoffContext::from_saved_markdown(&fragment.content).map_err(|error| {
+                VaultError::Schema(format!(
+                    "failed to read saved session handoff context {}: {}",
+                    fragment.file_path.display(),
+                    error
+                ))
+            })?;
+        saved.push(SavedSessionHandoffContext { fragment, handoff });
+    }
+
+    Ok(saved)
 }
 
 pub fn read_markdown_context_file(path: &Path) -> Result<String, VaultError> {
@@ -988,8 +1059,25 @@ pub fn read_resolved_context_markdown(
     working_dir: &Path,
     path: &Path,
 ) -> Result<String, VaultError> {
-    let context = resolve_context_path_from_overlay(working_dir, path)?;
-    read_markdown_context_file(&context.file_path)
+    Ok(read_resolved_context_fragment(working_dir, path)?.content)
+}
+
+pub fn read_resolved_context_fragment(
+    working_dir: &Path,
+    path: &Path,
+) -> Result<ContextFragment, VaultError> {
+    resolve_context_path_from_overlay(working_dir, path)
+}
+
+pub fn read_resolved_session_handoff_context(
+    working_dir: &Path,
+    path: &Path,
+) -> Result<SavedSessionHandoffContext, VaultError> {
+    let fragment = read_resolved_context_fragment(working_dir, path)?;
+    let handoff =
+        SessionHandoffContext::from_saved_markdown(&fragment.content).map_err(schema_error)?;
+
+    Ok(SavedSessionHandoffContext { fragment, handoff })
 }
 
 pub fn update_resolved_context_markdown(
@@ -1051,17 +1139,40 @@ fn resolve_context_path_from_overlay(
     path: &Path,
 ) -> Result<ContextFragment, VaultError> {
     let contexts = list_context_files_with_discovered(working_dir)?;
-    let requested_path = path.to_path_buf();
+    let requested_path = normalize_requested_context_path(working_dir, path);
 
     contexts
         .into_iter()
-        .find(|context| context.file_path == requested_path)
+        .find(|context| paths_refer_to_same_file(&context.file_path, &requested_path))
         .ok_or_else(|| {
             VaultError::Io(format!(
                 "context file is not part of the resolved vault overlay: {}",
-                path.display()
+                requested_path.display()
             ))
         })
+}
+
+fn normalize_requested_context_path(working_dir: &Path, path: &Path) -> PathBuf {
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_dir.join(path)
+    };
+
+    absolute_path
+        .canonicalize()
+        .unwrap_or_else(|_| absolute_path)
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn collect_context_files(
@@ -1157,11 +1268,14 @@ fn managed_context_fragment_from_change_event(
     let vault_root = event.root_path.parent().unwrap_or(&event.root_path);
     let import_metadata = load_import_metadata_index(vault_root)?;
     let import_record = import_metadata_record_for(&import_metadata, &event.root_path, &event.path);
+    let saved_metadata = saved_context_classification_metadata(&content);
     let classification = import_record
         .and_then(|record| record.classification)
+        .or(saved_metadata.classification)
         .unwrap_or(Classification::Shared);
-    let inferred_classification =
-        import_record.and_then(|record| record.inferred_classification.or(record.classification));
+    let inferred_classification = import_record
+        .and_then(|record| record.inferred_classification.or(record.classification))
+        .or(saved_metadata.classification);
     let import_classification_suggestion = import_record.and_then(|record| {
         record
             .import_classification_suggestion
@@ -1169,9 +1283,11 @@ fn managed_context_fragment_from_change_event(
     });
     let tags = import_record
         .map(|record| record.tags.clone())
-        .unwrap_or_default();
+        .filter(|tags| !tags.is_empty())
+        .unwrap_or_else(|| saved_metadata.tags.clone());
     let llm_classification_status = import_record
         .and_then(|record| record.llm_classification_status)
+        .or(saved_metadata.llm_classification_status)
         .unwrap_or(ClassificationStatus::Pending);
 
     Ok(ContextFragment {
@@ -1190,6 +1306,7 @@ fn managed_context_fragment_from_change_event(
         import_source: import_record.map(|record| record.import_source.clone()),
         import_source_type: import_record.map(|record| record.source_type),
         llm_classification_status,
+        session_handoff_classification: saved_metadata.session_handoff_classification,
     })
 }
 
@@ -1277,11 +1394,14 @@ fn collect_context_files_in_dir(
             .and_then(|name| name.to_str())
             .unwrap_or_default();
         let import_record = import_metadata_record_for(import_metadata, contexts_dir, &path);
+        let saved_metadata = saved_context_classification_metadata(&content);
         let classification = import_record
             .and_then(|record| record.classification)
+            .or(saved_metadata.classification)
             .unwrap_or(Classification::Shared);
         let inferred_classification = import_record
-            .and_then(|record| record.inferred_classification.or(record.classification));
+            .and_then(|record| record.inferred_classification.or(record.classification))
+            .or(saved_metadata.classification);
         let import_classification_suggestion = import_record.and_then(|record| {
             record
                 .import_classification_suggestion
@@ -1289,9 +1409,11 @@ fn collect_context_files_in_dir(
         });
         let tags = import_record
             .map(|record| record.tags.clone())
-            .unwrap_or_default();
+            .filter(|tags| !tags.is_empty())
+            .unwrap_or_else(|| saved_metadata.tags.clone());
         let llm_classification_status = import_record
             .and_then(|record| record.llm_classification_status)
+            .or(saved_metadata.llm_classification_status)
             .unwrap_or(ClassificationStatus::Pending);
 
         contexts.push(ContextFragment {
@@ -1310,6 +1432,7 @@ fn collect_context_files_in_dir(
             import_source: import_record.map(|record| record.import_source.clone()),
             import_source_type: import_record.map(|record| record.source_type),
             llm_classification_status,
+            session_handoff_classification: saved_metadata.session_handoff_classification,
         });
     }
 
@@ -1990,6 +2113,7 @@ fn context_from_discovery_result(
     result: ContextDiscoveryResult,
 ) -> Result<ContextFragment, VaultError> {
     let content = read_markdown_context_file(&result.file_path)?;
+    let session_handoff_classification = session_handoff_classification_metadata(&content);
 
     Ok(ContextFragment {
         context_id: Uuid::new_v4(),
@@ -2007,6 +2131,7 @@ fn context_from_discovery_result(
         import_source: Some(result.file_path),
         import_source_type: Some(result.source_type),
         llm_classification_status: result.metadata.llm_classification_status,
+        session_handoff_classification,
     })
 }
 
@@ -2223,6 +2348,7 @@ fn context_fragment_from_materialized_file(
         .and_then(|name| name.to_str())
         .map(context_title)
         .unwrap_or(metadata.title);
+    let session_handoff_classification = session_handoff_classification_metadata(&content);
 
     ContextFragment {
         context_id: Uuid::new_v4(),
@@ -2240,6 +2366,7 @@ fn context_fragment_from_materialized_file(
         import_source: Some(file_path),
         import_source_type: Some(source_type),
         llm_classification_status: metadata.llm_classification_status,
+        session_handoff_classification,
     }
 }
 
@@ -2921,6 +3048,24 @@ struct SimpleFrontmatterFields {
     title: Option<String>,
     tags: Vec<String>,
     classification: Option<Classification>,
+    source_tool: Option<String>,
+    source_session_ref: Option<String>,
+    source_working_directory: Option<String>,
+    source_log_path: Option<String>,
+    work_context_category: Option<String>,
+    work_context_categories: Vec<String>,
+    work_context_classification_status: Option<ClassificationStatus>,
+    work_context_confidence_score: Option<u8>,
+    work_context_rationale: Option<String>,
+    distillation_focus: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct SavedContextClassificationMetadata {
+    classification: Option<Classification>,
+    tags: Vec<String>,
+    llm_classification_status: Option<ClassificationStatus>,
+    session_handoff_classification: Option<SessionHandoffClassificationMetadata>,
 }
 
 #[derive(Debug, Default)]
@@ -2961,6 +3106,10 @@ fn parse_simple_frontmatter_fields(
             if let Some(item) = trimmed_line.strip_prefix("- ") {
                 if key.eq_ignore_ascii_case("tags") {
                     fields.tags.extend(parse_tag_list(item));
+                } else if key.eq_ignore_ascii_case("work_context_categories") {
+                    fields.work_context_categories.extend(parse_tag_list(item));
+                } else if key.eq_ignore_ascii_case("distillation_focus") {
+                    fields.distillation_focus.extend(parse_tag_list(item));
                 }
                 continue;
             }
@@ -2988,11 +3137,121 @@ fn parse_simple_frontmatter_fields(
             }
         } else if key.eq_ignore_ascii_case("classification") {
             fields.classification = parse_classification(value);
+        } else if key.eq_ignore_ascii_case("source_tool") {
+            fields.source_tool = non_empty_metadata_value(value);
+        } else if key.eq_ignore_ascii_case("source_session_ref") {
+            fields.source_session_ref = non_empty_metadata_value(value);
+        } else if key.eq_ignore_ascii_case("source_working_directory") {
+            fields.source_working_directory = non_empty_metadata_value(value);
+        } else if key.eq_ignore_ascii_case("source_log_path") {
+            fields.source_log_path = non_empty_metadata_value(value);
+        } else if key.eq_ignore_ascii_case("work_context_category") {
+            fields.work_context_category = non_empty_metadata_value(value);
+        } else if key.eq_ignore_ascii_case("work_context_categories") {
+            if value.is_empty() && format == FrontmatterFormat::Yaml {
+                active_list_key = Some(key.to_string());
+            } else {
+                fields.work_context_categories.extend(parse_tag_list(value));
+            }
+        } else if key.eq_ignore_ascii_case("work_context_classification_status") {
+            fields.work_context_classification_status = parse_classification_status(value);
+        } else if key.eq_ignore_ascii_case("work_context_confidence_score") {
+            fields.work_context_confidence_score = parse_confidence_score(value);
+        } else if key.eq_ignore_ascii_case("work_context_rationale") {
+            fields.work_context_rationale = non_empty_metadata_value(value);
+        } else if key.eq_ignore_ascii_case("distillation_focus") {
+            if value.is_empty() && format == FrontmatterFormat::Yaml {
+                active_list_key = Some(key.to_string());
+            } else {
+                fields.distillation_focus.extend(parse_tag_list(value));
+            }
         }
     }
 
     fields.tags = normalized_discovery_tags(fields.tags);
+    fields.work_context_categories = fields
+        .work_context_categories
+        .into_iter()
+        .map(|category| category.trim().to_ascii_lowercase())
+        .filter(|category| !category.is_empty())
+        .collect();
+    fields.distillation_focus = fields
+        .distillation_focus
+        .into_iter()
+        .map(|focus| focus.trim().to_string())
+        .filter(|focus| !focus.is_empty())
+        .collect();
     fields
+}
+
+fn saved_context_classification_metadata(content: &str) -> SavedContextClassificationMetadata {
+    let Some((format, raw, _)) = split_frontmatter(content) else {
+        return SavedContextClassificationMetadata::default();
+    };
+    let fields = parse_simple_frontmatter_fields(format, raw);
+    let session_handoff_classification =
+        session_handoff_classification_metadata_from_fields(&fields);
+
+    SavedContextClassificationMetadata {
+        classification: fields.classification,
+        tags: fields.tags,
+        llm_classification_status: fields.work_context_classification_status,
+        session_handoff_classification,
+    }
+}
+
+fn session_handoff_classification_metadata(
+    content: &str,
+) -> Option<SessionHandoffClassificationMetadata> {
+    let (format, raw, _) = split_frontmatter(content)?;
+    let fields = parse_simple_frontmatter_fields(format, raw);
+
+    session_handoff_classification_metadata_from_fields(&fields)
+}
+
+fn session_handoff_classification_metadata_from_fields(
+    fields: &SimpleFrontmatterFields,
+) -> Option<SessionHandoffClassificationMetadata> {
+    Some(SessionHandoffClassificationMetadata {
+        source_tool: fields.source_tool.clone()?,
+        source_session_ref: fields.source_session_ref.clone()?,
+        source_working_directory: fields.source_working_directory.clone().unwrap_or_default(),
+        source_log_path: fields.source_log_path.clone()?,
+        work_context_category: fields.work_context_category.clone()?,
+        work_context_categories: fields.work_context_categories.clone(),
+        work_context_classification_status: fields
+            .work_context_classification_status
+            .unwrap_or(ClassificationStatus::Pending),
+        work_context_confidence_score: fields.work_context_confidence_score.unwrap_or_default(),
+        work_context_rationale: fields.work_context_rationale.clone().unwrap_or_default(),
+        distillation_focus: fields.distillation_focus.clone(),
+    })
+}
+
+fn is_session_handoff_fragment(context: &ContextFragment) -> bool {
+    context.session_handoff_classification.is_some()
+        || context.tags.iter().any(|tag| {
+            tag.eq_ignore_ascii_case("session-history")
+                || tag.eq_ignore_ascii_case("resume-context")
+        })
+}
+
+fn schema_error(error: WorkContextSchemaError) -> VaultError {
+    VaultError::Schema(format!("invalid saved session handoff context: {error}"))
+}
+
+fn non_empty_metadata_value(value: &str) -> Option<String> {
+    let value = normalize_metadata_token(value);
+    (!value.is_empty()).then_some(value)
+}
+
+fn parse_confidence_score(value: &str) -> Option<u8> {
+    value
+        .trim()
+        .trim_end_matches('%')
+        .parse::<u16>()
+        .ok()
+        .map(|score| score.min(100) as u8)
 }
 
 fn parse_tag_list(value: &str) -> Vec<String> {
@@ -3001,7 +3260,7 @@ fn parse_tag_list(value: &str) -> Vec<String> {
         .strip_prefix('[')
         .and_then(|value| value.strip_suffix(']'))
         .unwrap_or(trimmed);
-    if is_quoted_scalar(trimmed) {
+    if is_quoted_scalar(trimmed) && !trimmed.contains(',') {
         let tag = normalize_metadata_token(trimmed);
         return (!tag.is_empty()).then_some(tag).into_iter().collect();
     }
@@ -3063,6 +3322,16 @@ fn parse_classification(value: &str) -> Option<Classification> {
         "main-agent" | "main_agent" | "main" => Some(Classification::MainAgent),
         "subagent" | "sub-agent" | "sub_agent" => Some(Classification::Subagent),
         "shared" => Some(Classification::Shared),
+        _ => None,
+    }
+}
+
+fn parse_classification_status(value: &str) -> Option<ClassificationStatus> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pending" => Some(ClassificationStatus::Pending),
+        "classified" => Some(ClassificationStatus::Classified),
+        "reviewed" => Some(ClassificationStatus::Reviewed),
+        "modified" => Some(ClassificationStatus::Modified),
         _ => None,
     }
 }
@@ -3603,18 +3872,21 @@ fn deterministic_id(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_vault_entry_key, create_context_file, delete_markdown_context_file,
-        delete_resolved_context_markdown, discover_existing_context_file_results,
-        discover_existing_context_files, discover_global_vault_path,
-        discover_project_local_vault_path, global_vault_path_from_home, import_metadata_path,
-        initialize_global_vault_path_from_home, initialize_project_local_vault, list_context_files,
-        list_context_files_with_discovered, load_import_metadata_index, managed_contexts_dir,
+        canonical_vault_entry_key, create_context_file, create_session_handoff_context_file,
+        delete_markdown_context_file, delete_resolved_context_markdown,
+        discover_existing_context_file_results, discover_existing_context_files,
+        discover_global_vault_path, discover_project_local_vault_path, global_vault_path_from_home,
+        import_metadata_path, initialize_global_vault_path_from_home,
+        initialize_project_local_vault, list_context_files, list_context_files_with_discovered,
+        list_session_handoff_contexts, load_import_metadata_index, managed_contexts_dir,
         materialize_discovered_context_files, normalize_import_source_path,
-        read_markdown_context_file, read_resolved_context_markdown, reindex_markdown_contexts,
-        resolve_overlay, resolve_overlay_vault, review_import_classification,
-        sync_markdown_context_index_event, sync_markdown_context_index_events,
-        update_markdown_context_file, VaultError, VaultRoots, CTX_HOME_DIR, GLOBAL_VAULT_DIR,
-        MANAGED_CONTEXTS_DIR,
+        read_markdown_context_file, read_resolved_context_fragment, read_resolved_context_markdown,
+        read_resolved_session_handoff_context, read_session_handoff_context_file,
+        reindex_markdown_contexts, resolve_overlay, resolve_overlay_vault,
+        review_import_classification, sync_markdown_context_index_event,
+        sync_markdown_context_index_events, update_markdown_context_file,
+        update_session_handoff_context_file, VaultError, VaultRoots, CTX_HOME_DIR,
+        GLOBAL_VAULT_DIR, MANAGED_CONTEXTS_DIR,
     };
     use crate::sqlite_index::{
         search_markdown_file_index_from_connection, sqlite_index_path, MARKDOWN_FILES_TABLE_NAME,
@@ -3623,8 +3895,10 @@ mod tests {
         MARKDOWN_FILE_TAGS_TABLE_NAME,
     };
     use crate::{
-        vault_settings_path, Classification, ClassificationStatus, ContextFileChangeEvent,
-        ContextFileChangeKind, ContextFragment, ContextWatchRootKind, ImportSourceType, VaultScope,
+        vault_settings_path, Classification, ClassificationStatus, CliTarget,
+        ContextFileChangeEvent, ContextFileChangeKind, ContextFragment, ContextWatchRootKind,
+        ImportSourceType, InjectionStrategy, SessionHandoffContext, SessionLogProvider, VaultScope,
+        WorkContextCategory, WorkContextRefineMode,
     };
     use rusqlite::{params, Connection};
     use std::{
@@ -3646,6 +3920,48 @@ mod tests {
         };
 
         (roots, base)
+    }
+
+    fn persisted_test_handoff_context(launch_target: CliTarget) -> SessionHandoffContext {
+        SessionHandoffContext {
+            source_tool: SessionLogProvider::Codex,
+            source_session_ref: "session-789".to_string(),
+            source_working_directory: "/workspace/app".to_string(),
+            source_log_path: "/logs/session-789.jsonl".to_string(),
+            source_updated_at: Some("2026-05-11T00:00:00Z".to_string()),
+            title: "Implement saved session persistence".to_string(),
+            category: WorkContextCategory::Launch,
+            categories: vec![
+                WorkContextCategory::Launch,
+                WorkContextCategory::Implementation,
+            ],
+            classification_status: ClassificationStatus::Classified,
+            classification_confidence_score: 92,
+            classification_rationale: "Launch and implementation signals were detected."
+                .to_string(),
+            goals: vec!["Save distilled session context".to_string()],
+            summary: "Implemented reusable handoff persistence.".to_string(),
+            key_changed_files: vec!["crates/ctx-core/src/vault.rs".to_string()],
+            commands: vec!["cargo test -p ctx-core vault::tests".to_string()],
+            decisions: vec!["Use the session handoff schema as the persisted contract.".to_string()],
+            verification_results: vec!["cargo test -p ctx-core vault::tests".to_string()],
+            remaining_work: vec!["Connect persisted entries to launch selection.".to_string()],
+            created_at: "2026-05-11T00:05:00Z".to_string(),
+            handoff_markdown: "# Previous Session Context\n\n## Handoff Summary\n\nImplemented reusable handoff persistence.\n\n### Goals\n\n- Save distilled session context\n\n### Key changed files\n\n- crates/ctx-core/src/vault.rs\n\n### Commands\n\n- cargo test -p ctx-core vault::tests\n\n### Decisions\n\n- Use the session handoff schema as the persisted contract.\n\n### Verification results\n\n- cargo test -p ctx-core vault::tests\n\n### Remaining work\n\n- Connect persisted entries to launch selection.".to_string(),
+            tags: vec![
+                "session-history".to_string(),
+                "resume-context".to_string(),
+                "codex".to_string(),
+                "launch".to_string(),
+            ],
+            cleanup_applied: true,
+            refine_mode: WorkContextRefineMode::Raw,
+            launch_target,
+            injection_method: match launch_target {
+                CliTarget::Claude => InjectionStrategy::AppendSystemPromptFile,
+                CliTarget::Codex => InjectionStrategy::AgentsMdSectionMarkerMerge,
+            },
+        }
     }
 
     fn context_by_entry_key<'a>(
@@ -3848,6 +4164,405 @@ mod tests {
         assert_eq!(listed.title, "main agent");
         assert_eq!(listed.folder_path, PathBuf::from("agents"));
         assert_eq!(listed.wikilinks, vec!["Shared Rules"]);
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn saved_session_context_hydrates_classification_metadata_from_frontmatter() {
+        let (roots, base) = test_roots();
+        let content = r#"---
+classification: shared
+tags: [session-history, resume-context, codex, launch]
+source_tool: codex
+source_session_ref: "session-123"
+source_working_directory: "/tmp/project"
+source_log_path: "/tmp/session-123.jsonl"
+work_context_category: launch
+work_context_categories: [launch, implementation]
+work_context_classification_status: classified
+work_context_confidence_score: 91
+work_context_rationale: "Launch and implementation signals were detected."
+distillation_focus: [launch target, cleanup behavior]
+---
+
+# Previous Session Context
+
+Implemented launch handoff.
+"#;
+
+        let created = create_context_file(
+            &roots,
+            VaultScope::Local,
+            "session-history",
+            "codex-session-123.md",
+            content,
+        )
+        .expect("session context should be saved");
+
+        assert_eq!(created.classification, Classification::Shared);
+        assert_eq!(
+            created.inferred_classification,
+            Some(Classification::Shared)
+        );
+        assert_eq!(
+            created.llm_classification_status,
+            ClassificationStatus::Classified
+        );
+        assert_eq!(
+            created.tags,
+            vec!["session-history", "resume-context", "codex", "launch"]
+        );
+        let created_metadata = created
+            .session_handoff_classification
+            .as_ref()
+            .expect("created context should expose handoff classification metadata");
+        assert_eq!(created_metadata.source_tool, "codex");
+        assert_eq!(created_metadata.source_session_ref, "session-123");
+        assert_eq!(created_metadata.work_context_category, "launch");
+        assert_eq!(created_metadata.work_context_confidence_score, 91);
+
+        let listed = list_context_files(&roots).expect("saved context should reload");
+        let reloaded = listed
+            .iter()
+            .find(|context| context.file_path.ends_with("codex-session-123.md"))
+            .expect("saved session context should be listed");
+
+        assert_eq!(reloaded.tags, created.tags);
+        assert_eq!(
+            reloaded.llm_classification_status,
+            ClassificationStatus::Classified
+        );
+        assert_eq!(
+            reloaded.session_handoff_classification,
+            created.session_handoff_classification
+        );
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn read_resolved_context_fragment_returns_saved_session_classification_metadata() {
+        let base =
+            std::env::temp_dir().join(format!("ctx-read-session-metadata-{}", Uuid::new_v4()));
+        let home = base.join("home");
+        let working_dir = base.join("project");
+        let roots = VaultRoots {
+            global_root: home.join(CTX_HOME_DIR).join(GLOBAL_VAULT_DIR),
+            local_root: Some(working_dir.join(CTX_HOME_DIR).join(GLOBAL_VAULT_DIR)),
+        };
+        let saved = create_context_file(
+            &roots,
+            VaultScope::Local,
+            "session-history",
+            "codex-session-456.md",
+            r#"---
+classification: shared
+tags: [session-history, resume-context, codex, verification]
+source_tool: codex
+source_session_ref: "session-456"
+source_working_directory: "/tmp/project"
+source_log_path: "/tmp/session-456.jsonl"
+work_context_category: verification
+work_context_categories: [verification, debugging]
+work_context_classification_status: classified
+work_context_confidence_score: 88
+work_context_rationale: "Verification and debugging signals were detected."
+distillation_focus: [commands run, failures]
+---
+
+# Previous Session Context
+
+Verified saved-session metadata readback.
+"#,
+        )
+        .expect("session context should be saved");
+
+        with_home(&home, || {
+            let reloaded = read_resolved_context_fragment(&working_dir, &saved.file_path)
+                .expect("saved session context should reload as a structured fragment");
+            let metadata = reloaded
+                .session_handoff_classification
+                .expect("saved session context should include classification metadata");
+
+            assert_eq!(
+                reloaded.llm_classification_status,
+                ClassificationStatus::Classified
+            );
+            assert_eq!(metadata.source_tool, "codex");
+            assert_eq!(metadata.source_session_ref, "session-456");
+            assert_eq!(metadata.work_context_category, "verification");
+            assert_eq!(
+                metadata.work_context_categories,
+                vec!["verification", "debugging"]
+            );
+            assert_eq!(metadata.work_context_confidence_score, 88);
+            assert_eq!(
+                metadata.distillation_focus,
+                vec!["commands run", "failures"]
+            );
+        });
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_handoff_context_persists_and_reads_full_schema() {
+        let (roots, base) = test_roots();
+        let handoff = persisted_test_handoff_context(CliTarget::Codex);
+
+        let saved = create_session_handoff_context_file(
+            &roots,
+            VaultScope::Local,
+            "session-history",
+            "codex-session-789.md",
+            &handoff,
+        )
+        .expect("session handoff should persist");
+
+        assert_eq!(saved.handoff, handoff);
+        assert_eq!(saved.fragment.classification, Classification::Shared);
+        assert_eq!(
+            saved
+                .fragment
+                .session_handoff_classification
+                .as_ref()
+                .expect("fragment should expose classification metadata")
+                .source_session_ref,
+            "session-789"
+        );
+
+        let read = read_session_handoff_context_file(&saved.fragment.file_path)
+            .expect("saved handoff schema should read from disk");
+        assert_eq!(read, handoff);
+
+        let listed = list_session_handoff_contexts(&roots)
+            .expect("saved handoff schemas should list from the vault");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].handoff, handoff);
+
+        let working_dir = roots
+            .local_root
+            .as_ref()
+            .and_then(|root| root.parent())
+            .and_then(|root| root.parent())
+            .expect("test local root should be under project .ctx/vault");
+        let resolved =
+            read_resolved_session_handoff_context(working_dir, &saved.fragment.file_path)
+                .expect("saved handoff schema should read through overlay resolution");
+        assert_eq!(resolved.handoff, handoff);
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_handoff_context_save_rejects_missing_required_fields_without_writing() {
+        let (roots, base) = test_roots();
+        let mut handoff = persisted_test_handoff_context(CliTarget::Codex);
+        handoff.summary.clear();
+        handoff.created_at = "  ".to_string();
+        handoff.handoff_markdown.clear();
+        handoff.tags.clear();
+
+        let error = create_session_handoff_context_file(
+            &roots,
+            VaultScope::Local,
+            "session-history",
+            "codex-missing-required.md",
+            &handoff,
+        )
+        .expect_err("handoff missing required fields should not persist");
+
+        let target_path = managed_contexts_dir(roots.local_root.as_ref().unwrap())
+            .join("session-history")
+            .join("codex-missing-required.md");
+        assert!(matches!(error, VaultError::Schema(_)));
+        assert!(error.to_string().contains("missing required save field"));
+        assert!(error.to_string().contains("summary"));
+        assert!(error.to_string().contains("created_at"));
+        assert!(error.to_string().contains("handoff_markdown"));
+        assert!(error.to_string().contains("tags"));
+        assert!(
+            !target_path.exists(),
+            "invalid handoff payload must fail before writing a context file"
+        );
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_handoff_context_save_rejects_invalid_field_values_without_writing() {
+        let (roots, base) = test_roots();
+        let mut handoff = persisted_test_handoff_context(CliTarget::Codex);
+        handoff.injection_method = InjectionStrategy::AppendSystemPromptFile;
+
+        let error = create_session_handoff_context_file(
+            &roots,
+            VaultScope::Local,
+            "session-history",
+            "codex-invalid-injection.md",
+            &handoff,
+        )
+        .expect_err("handoff with invalid launch injection pairing should not persist");
+
+        let target_path = managed_contexts_dir(roots.local_root.as_ref().unwrap())
+            .join("session-history")
+            .join("codex-invalid-injection.md");
+        assert!(matches!(error, VaultError::Schema(_)));
+        assert!(error.to_string().contains("injection_method"));
+        assert!(error.to_string().contains("launch_target"));
+        assert!(
+            !target_path.exists(),
+            "invalid handoff payload must fail before writing a context file"
+        );
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_handoff_context_save_rejects_unvalidated_context_without_writing() {
+        let (roots, base) = test_roots();
+        let mut handoff = persisted_test_handoff_context(CliTarget::Codex);
+        handoff.classification_status = ClassificationStatus::Pending;
+
+        let error = create_session_handoff_context_file(
+            &roots,
+            VaultScope::Local,
+            "session-history",
+            "codex-pending-classification.md",
+            &handoff,
+        )
+        .expect_err("pending session handoff classification should not persist");
+
+        let target_path = managed_contexts_dir(roots.local_root.as_ref().unwrap())
+            .join("session-history")
+            .join("codex-pending-classification.md");
+        assert!(matches!(error, VaultError::Schema(_)));
+        assert!(error.to_string().contains("classified before saving"));
+        assert!(
+            !target_path.exists(),
+            "unvalidated handoff payload must fail before writing a context file"
+        );
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_handoff_context_save_accepts_valid_claude_and_codex_payloads() {
+        let (roots, base) = test_roots();
+
+        for (launch_target, file_name, expected_injection_method) in [
+            (
+                CliTarget::Claude,
+                "claude-valid-session.md",
+                InjectionStrategy::AppendSystemPromptFile,
+            ),
+            (
+                CliTarget::Codex,
+                "codex-valid-session.md",
+                InjectionStrategy::AgentsMdSectionMarkerMerge,
+            ),
+        ] {
+            let handoff = persisted_test_handoff_context(launch_target);
+            let saved = create_session_handoff_context_file(
+                &roots,
+                VaultScope::Local,
+                "session-history",
+                file_name,
+                &handoff,
+            )
+            .expect("valid handoff payload should persist");
+
+            assert_eq!(saved.handoff, handoff);
+            assert_eq!(saved.handoff.launch_target, launch_target);
+            assert_eq!(saved.handoff.injection_method, expected_injection_method);
+            assert!(saved.fragment.file_path.exists());
+        }
+
+        let listed = list_session_handoff_contexts(&roots)
+            .expect("valid saved handoff payloads should list after persistence");
+        assert_eq!(listed.len(), 2);
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_handoff_context_create_rejects_duplicate_without_overwriting() {
+        let (roots, base) = test_roots();
+        let original = persisted_test_handoff_context(CliTarget::Codex);
+        let saved = create_session_handoff_context_file(
+            &roots,
+            VaultScope::Local,
+            "session-history",
+            "codex-session-789.md",
+            &original,
+        )
+        .expect("initial session handoff should persist");
+        let original_content = fs::read_to_string(&saved.fragment.file_path)
+            .expect("saved handoff should be readable");
+
+        let mut duplicate = original.clone();
+        duplicate.summary = "Attempted duplicate write must not replace the original.".to_string();
+        duplicate.handoff_markdown = "# Previous Session Context\n\n## Handoff Summary\n\nAttempted duplicate write must not replace the original.\n\n### Goals\n\n- Save distilled session context\n\n### Key changed files\n\n- crates/ctx-core/src/vault.rs\n\n### Commands\n\n- cargo test -p ctx-core vault::tests\n\n### Decisions\n\n- Use the session handoff schema as the persisted contract.\n\n### Verification results\n\n- cargo test -p ctx-core vault::tests\n\n### Remaining work\n\n- Connect persisted entries to launch selection.".to_string();
+
+        let error = create_session_handoff_context_file(
+            &roots,
+            VaultScope::Local,
+            "session-history",
+            "codex-session-789.md",
+            &duplicate,
+        )
+        .expect_err("duplicate session handoff create should fail");
+
+        assert!(matches!(error, VaultError::DuplicateContext(_)));
+        assert_eq!(
+            fs::read_to_string(&saved.fragment.file_path)
+                .expect("original handoff should remain readable"),
+            original_content
+        );
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_handoff_context_update_persists_distilled_fields() {
+        let (roots, base) = test_roots();
+        let original = persisted_test_handoff_context(CliTarget::Codex);
+        let saved = create_session_handoff_context_file(
+            &roots,
+            VaultScope::Local,
+            "session-history",
+            "codex-session-789.md",
+            &original,
+        )
+        .expect("session handoff should persist");
+
+        let mut updated = original;
+        updated.summary = "Updated the saved handoff entry with extracted fields.".to_string();
+        updated.key_changed_files = vec![
+            "crates/ctx-core/src/vault.rs".to_string(),
+            "src-tauri/src/lib.rs".to_string(),
+        ];
+        updated.decisions = vec!["Persist updates through the session handoff schema.".to_string()];
+        updated.verification_results = vec!["cargo test -p ctx-core vault::tests".to_string()];
+        updated.remaining_work = vec!["Verify desktop save uses the same schema.".to_string()];
+        updated.handoff_markdown = "# Previous Session Context\n\n## Handoff Summary\n\nUpdated the saved handoff entry with extracted fields.\n\n### Goals\n\n- Save distilled session context\n\n### Key changed files\n\n- crates/ctx-core/src/vault.rs\n- src-tauri/src/lib.rs\n\n### Commands\n\n- cargo test -p ctx-core vault::tests\n\n### Decisions\n\n- Persist updates through the session handoff schema.\n\n### Verification results\n\n- cargo test -p ctx-core vault::tests\n\n### Remaining work\n\n- Verify desktop save uses the same schema.".to_string();
+
+        let persisted = update_session_handoff_context_file(&saved.fragment.file_path, &updated)
+            .expect("updated handoff should persist through schema");
+
+        assert_eq!(persisted, updated);
+        let content =
+            fs::read_to_string(&saved.fragment.file_path).expect("updated handoff should read");
+        assert!(
+            content.contains("summary: \"Updated the saved handoff entry with extracted fields.\"")
+        );
+        assert!(content.contains(
+            "key_changed_files: [\"crates/ctx-core/src/vault.rs\", \"src-tauri/src/lib.rs\"]"
+        ));
+        assert!(content
+            .contains("decisions: [\"Persist updates through the session handoff schema.\"]"));
+        assert!(content.contains("remaining_work: [\"Verify desktop save uses the same schema.\"]"));
+
         fs::remove_dir_all(base).ok();
     }
 

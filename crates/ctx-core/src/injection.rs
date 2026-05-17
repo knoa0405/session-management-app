@@ -16,6 +16,8 @@ use uuid::Uuid;
 
 pub const CTX_START_MARKER: &str = "<!-- [ctx:start] -->";
 pub const CTX_END_MARKER: &str = "<!-- [ctx:end] -->";
+pub const AGENTS_MD_MANAGED_BLOCK_START_MARKER: &str = CTX_START_MARKER;
+pub const AGENTS_MD_MANAGED_BLOCK_END_MARKER: &str = CTX_END_MARKER;
 pub const AGENTS_MD_FILE_NAME: &str = "AGENTS.md";
 pub const WRAPPER_STATE_DIR_NAME: &str = "wrapper-sessions";
 pub const COMBINED_CONTEXT_ITEM_SEPARATOR: &str = "\n\n---\n\n";
@@ -71,6 +73,16 @@ impl fmt::Display for SectionReplaceError {
 
 impl Error for SectionReplaceError {}
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AgentsMdManagedSection<'a> {
+    pub start: usize,
+    pub end: usize,
+    pub prefix: &'a str,
+    pub section: &'a str,
+    pub body: &'a str,
+    pub suffix: &'a str,
+}
+
 pub fn build_agents_md_managed_section(content: &str) -> String {
     let trimmed_content = content.trim_matches('\n');
 
@@ -94,6 +106,26 @@ pub fn remove_agents_md_managed_section(
     replace_or_remove_agents_md_managed_section(agents_md_content, None)
 }
 
+pub fn locate_agents_md_managed_section(
+    agents_md_content: &str,
+) -> Result<Option<AgentsMdManagedSection<'_>>, SectionReplaceError> {
+    find_managed_section_bounds(agents_md_content)?
+        .map(|(start, end)| {
+            let body_start = start + AGENTS_MD_MANAGED_BLOCK_START_MARKER.len();
+            let body_end = end - AGENTS_MD_MANAGED_BLOCK_END_MARKER.len();
+
+            Ok(AgentsMdManagedSection {
+                start,
+                end,
+                prefix: &agents_md_content[..start],
+                section: &agents_md_content[start..end],
+                body: &agents_md_content[body_start..body_end],
+                suffix: &agents_md_content[end..],
+            })
+        })
+        .transpose()
+}
+
 fn replace_or_remove_agents_md_managed_section(
     agents_md_content: &str,
     managed_content: Option<&str>,
@@ -111,9 +143,14 @@ fn replace_or_remove_agents_md_managed_section(
             Ok(next)
         }
         (Some((start, end)), None) => {
+            let suffix_start = if &agents_md_content[end..] == "\n" {
+                end + 1
+            } else {
+                end
+            };
             let mut next = String::with_capacity(agents_md_content.len() - (end - start));
             next.push_str(&agents_md_content[..start]);
-            next.push_str(&agents_md_content[end..]);
+            next.push_str(&agents_md_content[suffix_start..]);
             Ok(next)
         }
         (None, Some(section)) => {
@@ -890,12 +927,38 @@ pub fn assemble_claude_prompt_file(
     let prompt =
         assemble_combined_context_output("CTX Claude Session Context", preset, &resolved_items);
 
+    write_claude_prompt_file(
+        &preset.preset_name,
+        &prompt,
+        resolved_items.iter().map(|item| item.context_id).collect(),
+    )
+}
+
+pub fn write_claude_handoff_prompt_file(
+    handoff_markdown: &str,
+) -> Result<ClaudePromptFile, PromptAssemblyError> {
+    let handoff_markdown = handoff_markdown.trim_matches('\n');
+    if handoff_markdown.trim().is_empty() {
+        return Err(PromptAssemblyError::InvalidSelection(
+            "selected handoff markdown is empty".to_string(),
+        ));
+    }
+
+    let prompt = format!("# CTX Claude Session Handoff\n\n{handoff_markdown}\n");
+    write_claude_prompt_file("session-handoff", &prompt, Vec::new())
+}
+
+fn write_claude_prompt_file(
+    prompt_name: &str,
+    prompt: &str,
+    selected_context_ids: Vec<Uuid>,
+) -> Result<ClaudePromptFile, PromptAssemblyError> {
     let prompt_dir = std::env::temp_dir().join("ctx").join("claude-prompts");
     fs::create_dir_all(&prompt_dir).map_err(|error| PromptAssemblyError::Io(error.to_string()))?;
 
     let prompt_path = prompt_dir.join(format!(
         "{}-{}.md",
-        sanitize_filename(&preset.preset_name),
+        sanitize_filename(prompt_name),
         Uuid::new_v4()
     ));
 
@@ -910,7 +973,7 @@ pub fn assemble_claude_prompt_file(
 
     Ok(ClaudePromptFile {
         path: prompt_path,
-        selected_context_ids: resolved_items.iter().map(|item| item.context_id).collect(),
+        selected_context_ids,
     })
 }
 
@@ -1428,10 +1491,54 @@ mod tests {
     }
 
     #[test]
+    fn write_claude_handoff_prompt_file_serializes_selected_handoff_markdown() {
+        let handoff_markdown = "\n# Previous Session Context\n\n## Handoff Summary\n\nCarry this saved work context into Claude.\n\n### Decisions\n\n- Use a temporary append-system-prompt file.\n";
+
+        let prompt_file = write_claude_handoff_prompt_file(handoff_markdown)
+            .expect("selected handoff markdown should be written to a prompt file");
+        let prompt = fs::read_to_string(&prompt_file.path).expect("prompt file should be readable");
+
+        assert!(prompt_file.selected_context_ids.is_empty());
+        assert_eq!(
+            prompt_file
+                .path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str()),
+            Some("claude-prompts")
+        );
+        assert!(prompt_file
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("prompt file name should be utf-8")
+            .starts_with("session-handoff-"));
+        assert!(prompt.starts_with("# CTX Claude Session Handoff\n\n"));
+        assert!(prompt.contains("# Previous Session Context"));
+        assert!(prompt.contains("Carry this saved work context into Claude."));
+        assert!(prompt.contains("Use a temporary append-system-prompt file."));
+        assert!(prompt.ends_with('\n'));
+
+        fs::remove_file(prompt_file.path).expect("test prompt file should be removable");
+    }
+
+    #[test]
+    fn write_claude_handoff_prompt_file_rejects_empty_handoff_markdown() {
+        assert_eq!(
+            write_claude_handoff_prompt_file("\n \n"),
+            Err(PromptAssemblyError::InvalidSelection(
+                "selected handoff markdown is empty".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn exposes_agents_md_section_marker_contract() {
         assert_eq!(AGENTS_MD_FILE_NAME, "AGENTS.md");
         assert_eq!(CTX_START_MARKER, "<!-- [ctx:start] -->");
         assert_eq!(CTX_END_MARKER, "<!-- [ctx:end] -->");
+        assert_eq!(AGENTS_MD_MANAGED_BLOCK_START_MARKER, CTX_START_MARKER);
+        assert_eq!(AGENTS_MD_MANAGED_BLOCK_END_MARKER, CTX_END_MARKER);
     }
 
     #[test]
@@ -1493,6 +1600,62 @@ mod tests {
         assert_eq!(
             actual,
             "Before\n\n\n<!-- [ctx:start] -->\nNew\n<!-- [ctx:end] -->\n\n\nAfter\n"
+        );
+    }
+
+    #[test]
+    fn locates_agents_md_managed_section_without_rewriting_surrounding_content() {
+        let existing = concat!(
+            "# Project\n",
+            "\n",
+            "Keep this prefix exactly.\n",
+            "\n",
+            "<!-- [ctx:start] -->\n",
+            "# CTX Codex Session Context\n",
+            "\n",
+            "Temporary handoff.\n",
+            "<!-- [ctx:end] -->",
+            "\n",
+            "\n",
+            "Keep this suffix exactly.\n",
+        );
+
+        let section = locate_agents_md_managed_section(existing)
+            .expect("marker parsing should succeed")
+            .expect("managed section should be present");
+
+        assert_eq!(
+            section.start,
+            "# Project\n\nKeep this prefix exactly.\n\n".len()
+        );
+        assert_eq!(section.prefix, "# Project\n\nKeep this prefix exactly.\n\n");
+        assert_eq!(
+            section.section,
+            concat!(
+                "<!-- [ctx:start] -->\n",
+                "# CTX Codex Session Context\n",
+                "\n",
+                "Temporary handoff.\n",
+                "<!-- [ctx:end] -->"
+            )
+        );
+        assert_eq!(
+            section.body,
+            "\n# CTX Codex Session Context\n\nTemporary handoff.\n"
+        );
+        assert_eq!(section.suffix, "\n\nKeep this suffix exactly.\n");
+        assert_eq!(
+            existing,
+            format!("{}{}{}", section.prefix, section.section, section.suffix)
+        );
+    }
+
+    #[test]
+    fn locate_agents_md_managed_section_reports_absence_without_mutation() {
+        assert_eq!(
+            locate_agents_md_managed_section("# Project\n\nNo managed handoff.")
+                .expect("missing markers should not fail"),
+            None
         );
     }
 
@@ -1590,6 +1753,10 @@ mod tests {
             replace_agents_md_managed_section(existing, "New").unwrap_err(),
             SectionReplaceError::MultipleManagedSections
         );
+        assert_eq!(
+            locate_agents_md_managed_section(existing).unwrap_err(),
+            SectionReplaceError::MultipleManagedSections
+        );
     }
 
     #[test]
@@ -1646,6 +1813,134 @@ mod tests {
             residual.reason,
             "managed ctx block is malformed: found start marker without end marker"
         );
+
+        remove_test_working_dir(working_dir);
+    }
+
+    #[test]
+    fn codex_agents_md_insertion_appends_managed_block_after_user_content() {
+        let working_dir = test_working_dir("focused-insertion-appends");
+        let agents_md_path = working_dir.join(AGENTS_MD_FILE_NAME);
+        let original = "# Project Agents\n\nManual rule before ctx launch.\n";
+        fs::write(&agents_md_path, original).expect("AGENTS.md fixture should be written");
+        let context = context("Focused Insert", "Inserted handoff context.");
+        let preset = codex_preset(&working_dir, "Focused Insertion", vec![context.context_id]);
+
+        let injection =
+            inject_codex_agents_md(&preset, &[context]).expect("managed block should append");
+        let agents_md = fs::read_to_string(&agents_md_path).expect("AGENTS.md should be readable");
+
+        assert!(injection.had_existing_file);
+        assert!(agents_md.starts_with(original.trim_end_matches('\n')));
+        assert!(agents_md.contains("Manual rule before ctx launch."));
+        assert!(agents_md.contains(CTX_START_MARKER));
+        assert!(agents_md.contains("# CTX Codex Session Context"));
+        assert!(agents_md.contains("Inserted handoff context."));
+        assert!(agents_md.ends_with(&format!("{CTX_END_MARKER}\n")));
+        assert_eq!(agents_md.matches(CTX_START_MARKER).count(), 1);
+        assert_eq!(agents_md.matches(CTX_END_MARKER).count(), 1);
+
+        cleanup_codex_agents_md(&injection).expect("cleanup should remove managed section");
+        remove_test_working_dir(working_dir);
+    }
+
+    #[test]
+    fn codex_agents_md_replacement_updates_only_existing_managed_block() {
+        let working_dir = test_working_dir("focused-replacement-only-managed");
+        let agents_md_path = working_dir.join(AGENTS_MD_FILE_NAME);
+        fs::write(
+            &agents_md_path,
+            concat!(
+                "# Existing Agents\n",
+                "\n",
+                "Manual rule before block.\n",
+                "\n",
+                "<!-- [ctx:start] -->\n",
+                "Old generated handoff.\n",
+                "<!-- [ctx:end] -->\n",
+                "\n",
+                "Manual rule after block.\n",
+            ),
+        )
+        .expect("AGENTS.md fixture should be written");
+        let context = context("Focused Replacement", "Fresh generated handoff.");
+        let preset = codex_preset(
+            &working_dir,
+            "Focused Replacement",
+            vec![context.context_id],
+        );
+
+        let injection =
+            inject_codex_agents_md(&preset, &[context]).expect("managed block should replace");
+        let agents_md = fs::read_to_string(&agents_md_path).expect("AGENTS.md should be readable");
+
+        assert!(injection.had_existing_file);
+        assert!(agents_md.contains("# Existing Agents"));
+        assert!(agents_md.contains("Manual rule before block."));
+        assert!(agents_md.contains("Manual rule after block."));
+        assert!(agents_md.contains("Fresh generated handoff."));
+        assert!(!agents_md.contains("Old generated handoff."));
+        assert_eq!(agents_md.matches(CTX_START_MARKER).count(), 1);
+        assert_eq!(agents_md.matches(CTX_END_MARKER).count(), 1);
+
+        cleanup_codex_agents_md(&injection).expect("cleanup should remove managed section");
+        remove_test_working_dir(working_dir);
+    }
+
+    #[test]
+    fn codex_agents_md_missing_file_creation_writes_only_managed_block() {
+        let working_dir = test_working_dir("focused-missing-file-creation");
+        let agents_md_path = working_dir.join(AGENTS_MD_FILE_NAME);
+        let context = context("Focused Creation", "Create AGENTS.md for this handoff.");
+        let preset = codex_preset(&working_dir, "Focused Creation", vec![context.context_id]);
+
+        let injection =
+            inject_codex_agents_md(&preset, &[context]).expect("missing AGENTS.md should create");
+        let agents_md = fs::read_to_string(&agents_md_path).expect("AGENTS.md should be created");
+
+        assert!(!injection.had_existing_file);
+        assert!(agents_md.starts_with(CTX_START_MARKER));
+        assert!(agents_md.contains("# CTX Codex Session Context"));
+        assert!(agents_md.contains("Create AGENTS.md for this handoff."));
+        assert!(agents_md.ends_with(&format!("{CTX_END_MARKER}\n")));
+        assert_eq!(agents_md.matches(CTX_START_MARKER).count(), 1);
+        assert_eq!(agents_md.matches(CTX_END_MARKER).count(), 1);
+
+        cleanup_codex_agents_md(&injection).expect("cleanup should remove temporary AGENTS.md");
+        assert!(!agents_md_path.exists());
+        remove_test_working_dir(working_dir);
+    }
+
+    #[test]
+    fn codex_agents_md_preserves_user_authored_content_after_cleanup() {
+        let working_dir = test_working_dir("focused-preserve-user-content");
+        let agents_md_path = working_dir.join(AGENTS_MD_FILE_NAME);
+        let original = concat!(
+            "# Project Agents\n",
+            "\n",
+            "Manual rule before launch.\n",
+            "\n",
+            "## Local Notes\n",
+            "Keep these user-authored notes.\n"
+        );
+        fs::write(&agents_md_path, original).expect("AGENTS.md fixture should be written");
+        let context = context("Focused Preserve", "Temporary generated handoff.");
+        let preset = codex_preset(&working_dir, "Focused Preserve", vec![context.context_id]);
+
+        let injection =
+            inject_codex_agents_md(&preset, &[context]).expect("managed block should append");
+        cleanup_codex_agents_md(&injection).expect("cleanup should preserve manual content");
+        let agents_md = fs::read_to_string(&agents_md_path).expect("AGENTS.md should remain");
+
+        assert_eq!(
+            agents_md,
+            original.trim_end_matches('\n').to_string() + "\n\n"
+        );
+        assert!(agents_md.contains("Manual rule before launch."));
+        assert!(agents_md.contains("Keep these user-authored notes."));
+        assert!(!agents_md.contains("Temporary generated handoff."));
+        assert!(!agents_md.contains(CTX_START_MARKER));
+        assert!(!agents_md.contains(CTX_END_MARKER));
 
         remove_test_working_dir(working_dir);
     }
@@ -2629,6 +2924,7 @@ mod tests {
             import_source: None,
             import_source_type: None,
             llm_classification_status: ClassificationStatus::Reviewed,
+            session_handoff_classification: None,
         }
     }
 

@@ -1,20 +1,28 @@
 use ctx_core::{
-    app_status, classify_import_markdown_content, configured_context_watch_roots,
-    create_context_file, delete_resolved_context_markdown, diff_context_file_snapshots,
+    app_status, classify_import_markdown_content, classify_work_context_detail,
+    configured_context_watch_roots, create_context_file, create_session_handoff_context_file,
+    delete_resolved_context_markdown, diff_context_file_snapshots,
     discover_existing_context_file_results, injection_strategy, list_context_files_with_discovered,
-    list_presets_from_resolved_overlay, lookup_markdown_context_index,
-    lookup_markdown_contexts_by_tag, materialize_discovered_context_files,
-    read_resolved_context_markdown, resolve_overlay_vault,
+    list_presets_from_resolved_overlay, list_session_handoff_contexts,
+    lookup_markdown_context_index, lookup_markdown_contexts_by_tag,
+    materialize_discovered_context_files, read_resolved_context_fragment,
+    read_resolved_session_handoff_context, resolve_claude_session_log_roots,
+    resolve_codex_session_log_roots, resolve_overlay_vault,
     review_import_classification as review_core_import_classification,
     save_preset_execution_settings as save_core_preset_execution_settings,
     save_preset_subagent_manifest as save_core_preset_subagent_manifest,
     snapshot_context_directories, sync_markdown_context_index_events,
-    update_resolved_context_markdown, AppStatus, Classification, CliTarget, ContextDiscoveryResult,
-    ContextFileChangeEvent, ContextFileSnapshot, ContextFragment, ContextWatchRoot,
-    ImportSourceType, ImportTimeClassificationRequest, ImportTimeClassificationResult,
+    update_resolved_context_markdown, AppStatus, Classification, ClaudeSessionLogScanner,
+    CliTarget, CodexSessionLogScanner, ContextDiscoveryResult, ContextFileChangeEvent,
+    ContextFileSnapshot, ContextFragment, ContextWatchRoot, ImportSourceType,
+    ImportTimeClassificationRequest, ImportTimeClassificationResult,
     IncrementalMarkdownIndexReport, LocalHeadlessCliClassificationAdapter,
     MarkdownFileMetadataRecord, OverlayMarkdownIndexLookup, PresetExecutionSettingsUpdate,
-    PresetSummary, SubagentManifestUpdate, VaultError, VaultRoots, VaultScope,
+    PresetSummary, SavedSessionHandoffContext, SessionHandoffContext,
+    SessionLogDetail as AgentSessionDetail, SessionLogMessage as AgentSessionMessage,
+    SessionLogMetadata as AgentSessionSummary, SessionLogProvider, SessionLogScanRequest,
+    SessionLogScanner, SubagentManifestUpdate, VaultError, VaultRoots, VaultScope,
+    WorkContextClassificationResult, WorkContextRefineMode, WorkContextSignalSet,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,6 +30,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    process::Command,
     time::SystemTime,
 };
 
@@ -153,9 +162,23 @@ struct CtxIntegrationPreview {
     message: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadAgentSessionRequest {
+    provider: String,
+    file_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RefineSessionContextRequest {
+    draft_content: String,
+    target_cli: Option<CliTarget>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct AgentSessionSummary {
+struct AgentSessionSummaryResponse {
     provider: String,
     session_id: String,
     title: String,
@@ -164,29 +187,77 @@ struct AgentSessionSummary {
     file_path: PathBuf,
     message_count: usize,
     last_user_message: Option<String>,
+    classification_metadata: Option<SessionClassificationMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct AgentSessionMessage {
-    role: String,
-    timestamp: Option<String>,
-    content: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentSessionDetail {
+struct AgentSessionDetailResponse {
     summary: AgentSessionSummary,
     messages: Vec<AgentSessionMessage>,
     distilled_markdown: String,
+    classification_metadata: SessionClassificationMetadata,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionClassificationMetadata {
+    source_tool: String,
+    source_session_ref: String,
+    source_working_directory: String,
+    source_log_path: String,
+    work_context_category: String,
+    work_context_categories: Vec<String>,
+    work_context_classification_status: ctx_core::ClassificationStatus,
+    work_context_confidence_score: u8,
+    work_context_rationale: String,
+    distillation_focus: Vec<String>,
+}
+
+impl From<WorkContextClassificationResult> for SessionClassificationMetadata {
+    fn from(classification: WorkContextClassificationResult) -> Self {
+        Self {
+            source_tool: classification.source_tool.as_str().to_string(),
+            source_session_ref: classification.source_session_ref,
+            source_working_directory: classification.source_working_directory,
+            source_log_path: classification.source_log_path,
+            work_context_category: classification.category.as_str().to_string(),
+            work_context_categories: classification
+                .categories
+                .into_iter()
+                .map(|category| category.as_str().to_string())
+                .collect(),
+            work_context_classification_status: classification.status,
+            work_context_confidence_score: classification.confidence_score,
+            work_context_rationale: classification.rationale,
+            distillation_focus: classification.distillation_focus,
+        }
+    }
+}
+
+impl From<AgentSessionSummary> for AgentSessionSummaryResponse {
+    fn from(summary: AgentSessionSummary) -> Self {
+        Self {
+            provider: summary.provider,
+            session_id: summary.session_id,
+            title: summary.title,
+            updated_at: summary.updated_at,
+            cwd: summary.cwd,
+            file_path: summary.file_path,
+            message_count: summary.message_count,
+            last_user_message: summary.last_user_message,
+            classification_metadata: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ReadAgentSessionRequest {
+struct SaveAgentSessionContextRequest {
     provider: String,
     file_path: PathBuf,
+    content: String,
+    working_dir: Option<PathBuf>,
 }
 
 #[tauri::command]
@@ -217,23 +288,33 @@ fn preview_ctx_launch(request: CtxIntegrationRequest) -> CtxIntegrationPreview {
 }
 
 #[tauri::command]
-fn list_agent_sessions() -> Result<Vec<AgentSessionSummary>, String> {
+fn list_agent_sessions() -> Result<Vec<AgentSessionSummaryResponse>, String> {
     let home_dir = home_dir()?;
+    let working_dir = std::env::current_dir()
+        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
     let mut sessions = Vec::new();
 
-    sessions.extend(list_codex_sessions(&home_dir)?);
-    sessions.extend(list_claude_sessions(&home_dir)?);
+    sessions.extend(list_codex_sessions(&home_dir, &working_dir)?);
+    sessions.extend(list_claude_sessions(&home_dir, &working_dir)?);
     sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     sessions.truncate(250);
 
-    Ok(sessions)
+    Ok(sessions
+        .into_iter()
+        .map(session_summary_with_classification)
+        .collect())
 }
 
 #[tauri::command]
-fn read_agent_session(request: ReadAgentSessionRequest) -> Result<AgentSessionDetail, String> {
+fn read_agent_session(
+    request: ReadAgentSessionRequest,
+) -> Result<AgentSessionDetailResponse, String> {
     let file_path = request.file_path;
     if !file_path.exists() {
-        return Err(format!("session file does not exist: {}", file_path.display()));
+        return Err(format!(
+            "session file does not exist: {}",
+            file_path.display()
+        ));
     }
 
     let provider = request.provider.to_lowercase();
@@ -243,7 +324,220 @@ fn read_agent_session(request: ReadAgentSessionRequest) -> Result<AgentSessionDe
         other => return Err(format!("unsupported session provider: {other}")),
     };
 
-    Ok(detail)
+    let classification = classify_work_context_detail(&detail)
+        .map_err(|error| format!("failed to classify session context: {error}"))?;
+
+    Ok(AgentSessionDetailResponse {
+        summary: detail.summary,
+        messages: detail.messages,
+        distilled_markdown: detail.distilled_markdown,
+        classification_metadata: SessionClassificationMetadata::from(classification),
+    })
+}
+
+#[tauri::command]
+fn save_agent_session_context(
+    request: SaveAgentSessionContextRequest,
+) -> Result<ContextFragment, String> {
+    if request.content.trim().is_empty() {
+        return Err("session handoff content cannot be empty".to_string());
+    }
+
+    let working_dir = resolve_requested_working_dir(request.working_dir)?;
+    let detail = parse_agent_session_detail(&request.provider, &request.file_path)?;
+    let classification = classify_work_context_detail(&detail)
+        .map_err(|error| format!("failed to classify session context: {error}"))?;
+    let signal_set = WorkContextSignalSet::from_session_detail(&detail)
+        .map_err(|error| format!("failed to normalize session handoff context: {error}"))?;
+    let handoff = SessionHandoffContext::from_classified_signals(
+        &signal_set,
+        &classification,
+        current_timestamp_string()?,
+        &request.content,
+        default_launch_target_for_session_detail(&detail),
+        WorkContextRefineMode::Raw,
+    )
+    .map_err(|error| format!("failed to extract distilled session handoff fields: {error}"))?;
+    handoff
+        .validate_for_save()
+        .map_err(|error| format!("invalid distilled session handoff context: {error}"))?;
+    let roots = VaultRoots::discover(&working_dir);
+    let file_name = format!(
+        "{}-{}.md",
+        sanitize_context_file_token(&detail.summary.provider),
+        sanitize_context_file_token(&detail.summary.session_id)
+    );
+
+    create_session_handoff_context_file(
+        &roots,
+        VaultScope::Local,
+        PathBuf::from("session-history"),
+        &file_name,
+        &handoff,
+    )
+    .map(|saved| saved.fragment)
+    .map_err(|error| error.to_string())
+}
+
+fn default_launch_target_for_session_detail(detail: &AgentSessionDetail) -> CliTarget {
+    match detail.summary.provider_kind() {
+        Some(SessionLogProvider::Claude) => CliTarget::Claude,
+        Some(SessionLogProvider::Codex) | None => CliTarget::Codex,
+    }
+}
+
+fn current_timestamp_string() -> Result<String, String> {
+    let seconds = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("failed to resolve current timestamp: {error}"))?
+        .as_secs();
+    Ok(format!("unix-seconds:{seconds}"))
+}
+
+fn parse_agent_session_detail(
+    provider: &str,
+    file_path: &Path,
+) -> Result<AgentSessionDetail, String> {
+    if !file_path.exists() {
+        return Err(format!(
+            "session file does not exist: {}",
+            file_path.display()
+        ));
+    }
+
+    match provider.to_lowercase().as_str() {
+        "codex" => parse_codex_session_file(file_path, None),
+        "claude" => parse_claude_session_file(file_path),
+        other => Err(format!("unsupported session provider: {other}")),
+    }
+}
+
+fn session_summary_with_classification(
+    summary: AgentSessionSummary,
+) -> AgentSessionSummaryResponse {
+    let classification_metadata = parse_agent_session_detail(&summary.provider, &summary.file_path)
+        .ok()
+        .and_then(|detail| classify_work_context_detail(&detail).ok())
+        .map(SessionClassificationMetadata::from);
+
+    AgentSessionSummaryResponse {
+        classification_metadata,
+        ..AgentSessionSummaryResponse::from(summary)
+    }
+}
+
+fn sanitize_context_file_token(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+
+    if sanitized.is_empty() {
+        "session".to_string()
+    } else {
+        sanitized.chars().take(120).collect()
+    }
+}
+
+#[tauri::command]
+fn refine_session_context(request: RefineSessionContextRequest) -> Result<String, String> {
+    if request.draft_content.trim().is_empty() {
+        return Err("refinement draft cannot be empty".to_string());
+    }
+
+    let target = request.target_cli.unwrap_or(CliTarget::Claude);
+    let prompt = build_session_refinement_prompt(&request.draft_content);
+    run_refinement_cli(target, &prompt)
+}
+
+fn build_session_refinement_prompt(draft: &str) -> String {
+    format!(
+        r#"You are preparing context for a new coding-agent session.
+
+Rewrite the raw previous-session transcript into a concise Korean handoff note.
+Do not invent facts. Preserve concrete filenames, commands, decisions, verification results, blockers, and remaining work when present.
+Remove noisy tool output and repeated status chatter.
+
+Return only markdown with this exact structure. Keep the heading text in English so the app can validate and save the result, but write the bullet content in Korean when useful:
+
+# Previous Session Context
+
+## Handoff Summary
+
+### Goals
+
+### Current state
+
+### Key changed files
+
+### Decisions
+
+### Verification results
+
+### Remaining work
+
+### Notes for next session
+
+Raw previous-session draft:
+
+```markdown
+{draft}
+```
+"#
+    )
+}
+
+fn run_refinement_cli(target: CliTarget, prompt: &str) -> Result<String, String> {
+    let output = match target {
+        CliTarget::Claude => {
+            let program = std::env::var("CTX_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+            Command::new(&program)
+                .arg("--print")
+                .arg("--output-format")
+                .arg("text")
+                .arg(prompt)
+                .output()
+                .map_err(|error| {
+                    format!("failed to launch Claude refinement CLI '{program}': {error}")
+                })?
+        }
+        CliTarget::Codex => {
+            let program = std::env::var("CTX_CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
+            Command::new(&program)
+                .arg("exec")
+                .arg(prompt)
+                .output()
+                .map_err(|error| {
+                    format!("failed to launch Codex refinement CLI '{program}': {error}")
+                })?
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "refinement CLI exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+
+    let refined = String::from_utf8(output.stdout)
+        .map_err(|error| format!("refinement CLI returned non-UTF8 output: {error}"))?;
+    let refined = refined.trim();
+    if refined.is_empty() {
+        return Err("refinement CLI returned empty output".to_string());
+    }
+
+    Ok(refined.to_string())
 }
 
 fn home_dir() -> Result<PathBuf, String> {
@@ -252,97 +546,52 @@ fn home_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "HOME directory is not available".to_string())
 }
 
-fn list_codex_sessions(home_dir: &Path) -> Result<Vec<AgentSessionSummary>, String> {
-    let codex_root = home_dir.join(".codex");
-    let session_root = codex_root.join("sessions");
-    if !session_root.exists() {
-        return Ok(Vec::new());
-    }
+fn list_codex_sessions(
+    home_dir: &Path,
+    working_dir: &Path,
+) -> Result<Vec<AgentSessionSummary>, String> {
+    let roots = VaultRoots::discover(working_dir);
+    let codex_roots = resolve_codex_session_log_roots(&roots, working_dir, home_dir)
+        .map_err(|error| format!("failed to resolve Codex session log roots: {error}"))?;
+    let root_paths = codex_roots
+        .into_iter()
+        .map(|root| root.path)
+        .collect::<Vec<_>>();
+    let scanner = CodexSessionLogScanner;
+    let result = scanner
+        .scan_session_logs(&SessionLogScanRequest {
+            provider: SessionLogProvider::Codex,
+            home_dir: home_dir.to_path_buf(),
+            working_dir: working_dir.to_path_buf(),
+            root_paths,
+        })
+        .map_err(|error| error.to_string())?;
 
-    let index = read_codex_session_index(&codex_root.join("session_index.jsonl"))?;
-    let mut files = Vec::new();
-    collect_jsonl_files(&session_root, &mut files).map_err(|error| error.to_string())?;
-
-    let mut sessions = Vec::new();
-    for file in files {
-        if let Ok(detail) = parse_codex_session_file(&file, Some(&index)) {
-            sessions.push(detail.summary);
-        }
-    }
-
-    Ok(sessions)
+    Ok(result.sessions)
 }
 
-fn list_claude_sessions(home_dir: &Path) -> Result<Vec<AgentSessionSummary>, String> {
-    let claude_root = home_dir.join(".claude").join("projects");
-    if !claude_root.exists() {
-        return Ok(Vec::new());
-    }
+fn list_claude_sessions(
+    home_dir: &Path,
+    working_dir: &Path,
+) -> Result<Vec<AgentSessionSummary>, String> {
+    let roots = VaultRoots::discover(working_dir);
+    let claude_roots = resolve_claude_session_log_roots(&roots, working_dir, home_dir)
+        .map_err(|error| format!("failed to resolve Claude session log roots: {error}"))?;
+    let root_paths = claude_roots
+        .into_iter()
+        .map(|root| root.path)
+        .collect::<Vec<_>>();
+    let scanner = ClaudeSessionLogScanner;
+    let result = scanner
+        .scan_session_logs(&SessionLogScanRequest {
+            provider: SessionLogProvider::Claude,
+            home_dir: home_dir.to_path_buf(),
+            working_dir: working_dir.to_path_buf(),
+            root_paths,
+        })
+        .map_err(|error| error.to_string())?;
 
-    let mut files = Vec::new();
-    collect_jsonl_files(&claude_root, &mut files).map_err(|error| error.to_string())?;
-
-    let mut sessions = Vec::new();
-    for file in files {
-        if file
-            .components()
-            .any(|component| component.as_os_str() == "subagents")
-        {
-            continue;
-        }
-
-        if let Ok(detail) = parse_claude_session_file(&file) {
-            if detail.summary.message_count > 0 {
-                sessions.push(detail.summary);
-            }
-        }
-    }
-
-    Ok(sessions)
-}
-
-fn collect_jsonl_files(root: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_jsonl_files(&path, files)?;
-        } else if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
-            files.push(path);
-        }
-    }
-
-    Ok(())
-}
-
-fn read_codex_session_index(index_path: &Path) -> Result<HashMap<String, (String, String)>, String> {
-    let mut index = HashMap::new();
-    if !index_path.exists() {
-        return Ok(index);
-    }
-
-    let content = fs::read_to_string(index_path).map_err(|error| error.to_string())?;
-    for line in content.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(id) = value.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        let title = value
-            .get("thread_name")
-            .and_then(Value::as_str)
-            .unwrap_or("Codex 세션")
-            .to_string();
-        let updated_at = value
-            .get("updated_at")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        index.insert(id.to_string(), (title, updated_at));
-    }
-
-    Ok(index)
+    Ok(result.sessions)
 }
 
 fn parse_codex_session_file(
@@ -364,7 +613,10 @@ fn parse_codex_session_file(
             .get("timestamp")
             .and_then(Value::as_str)
             .map(ToString::to_string);
-        let record_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+        let record_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let payload = value.get("payload").unwrap_or(&Value::Null);
 
         if record_type == "session_meta" {
@@ -384,7 +636,11 @@ fn parse_codex_session_file(
         }
 
         if record_type == "event_msg" {
-            match payload.get("type").and_then(Value::as_str).unwrap_or_default() {
+            match payload
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+            {
                 "user_message" => {
                     if let Some(message) = payload.get("message").and_then(Value::as_str) {
                         let text = truncate_text(message, 12_000);
@@ -460,6 +716,7 @@ fn parse_codex_session_file(
     Ok(AgentSessionDetail {
         summary,
         messages,
+        events: Vec::new(),
         distilled_markdown,
     })
 }
@@ -476,12 +733,18 @@ fn parse_claude_session_file(file_path: &Path) -> Result<AgentSessionDetail, Str
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let record_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+        let record_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if let Some(id) = value.get("sessionId").and_then(Value::as_str) {
             session_id = id.to_string();
         }
         if cwd.is_none() {
-            cwd = value.get("cwd").and_then(Value::as_str).map(ToString::to_string);
+            cwd = value
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
         }
         let timestamp = value
             .get("timestamp")
@@ -545,6 +808,7 @@ fn parse_claude_session_file(file_path: &Path) -> Result<AgentSessionDetail, Str
     Ok(AgentSessionDetail {
         summary,
         messages,
+        events: Vec::new(),
         distilled_markdown,
     })
 }
@@ -557,7 +821,11 @@ fn text_from_json_content(content: &Value) -> String {
             .filter_map(|item| {
                 item.as_str()
                     .map(ToString::to_string)
-                    .or_else(|| item.get("text").and_then(Value::as_str).map(ToString::to_string))
+                    .or_else(|| {
+                        item.get("text")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string)
+                    })
                     .or_else(|| {
                         item.get("content")
                             .map(text_from_json_content)
@@ -598,10 +866,17 @@ fn distilled_session_markdown(
     if let Some(cwd) = &summary.cwd {
         markdown.push_str(&format!("- 작업 디렉터리: `{cwd}`\n"));
     }
-    markdown.push_str(&format!("- 원본 로그: `{}`\n\n", summary.file_path.display()));
+    markdown.push_str(&format!(
+        "- 원본 로그: `{}`\n\n",
+        summary.file_path.display()
+    ));
     markdown.push_str("## 다음 세션에 전달할 핵심 맥락\n\n");
-    markdown.push_str("- 이 초안은 이전 세션 로그에서 사용자 요청과 어시스턴트 응답을 추출한 것입니다.\n");
-    markdown.push_str("- 새 세션에 넣기 전에 불필요한 중간 출력, 민감 정보, 오래된 결정을 정리하세요.\n\n");
+    markdown.push_str(
+        "- 이 초안은 이전 세션 로그에서 사용자 요청과 어시스턴트 응답을 추출한 것입니다.\n",
+    );
+    markdown.push_str(
+        "- 새 세션에 넣기 전에 불필요한 중간 출력, 민감 정보, 오래된 결정을 정리하세요.\n\n",
+    );
     markdown.push_str("## 대화 타임라인\n\n");
 
     for message in messages.iter().take(80) {
@@ -652,13 +927,28 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
     truncated
 }
 
+fn default_working_dir() -> Result<PathBuf, String> {
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+
+    if cwd.file_name().and_then(|name| name.to_str()) == Some("src-tauri") {
+        if let Some(parent) = cwd.parent() {
+            if parent.join("package.json").exists() && parent.join("src-tauri").exists() {
+                return Ok(parent.to_path_buf());
+            }
+        }
+    }
+
+    Ok(cwd)
+}
+
+fn resolve_requested_working_dir(working_dir: Option<PathBuf>) -> Result<PathBuf, String> {
+    working_dir.map_or_else(default_working_dir, Ok)
+}
+
 #[tauri::command]
 fn create_markdown_context(request: CreateContextFileRequest) -> Result<ContextFragment, String> {
-    let working_dir = request
-        .working_dir
-        .map(Ok)
-        .unwrap_or_else(std::env::current_dir)
-        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+    let working_dir = resolve_requested_working_dir(request.working_dir)?;
     let roots = VaultRoots::discover(&working_dir);
     let folder_path = request.folder_path.unwrap_or_default();
     let content = request.content.unwrap_or_default();
@@ -677,25 +967,30 @@ fn create_markdown_context(request: CreateContextFileRequest) -> Result<ContextF
 fn list_markdown_contexts(
     request: Option<ListContextFilesRequest>,
 ) -> Result<Vec<ContextFragment>, String> {
-    let working_dir = request
-        .and_then(|request| request.working_dir)
-        .map(Ok)
-        .unwrap_or_else(std::env::current_dir)
-        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+    let working_dir =
+        resolve_requested_working_dir(request.and_then(|request| request.working_dir))?;
     resolve_overlay_vault(&working_dir)
         .map(|vault| vault.contexts)
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
+fn list_saved_session_contexts(
+    request: Option<ListContextFilesRequest>,
+) -> Result<Vec<SavedSessionHandoffContext>, String> {
+    let working_dir =
+        resolve_requested_working_dir(request.and_then(|request| request.working_dir))?;
+    let roots = VaultRoots::discover(&working_dir);
+
+    list_session_handoff_contexts(&roots).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn discover_markdown_contexts(
     request: Option<ListContextFilesRequest>,
 ) -> Result<Vec<ContextFragment>, String> {
-    let working_dir = request
-        .and_then(|request| request.working_dir)
-        .map(Ok)
-        .unwrap_or_else(std::env::current_dir)
-        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+    let working_dir =
+        resolve_requested_working_dir(request.and_then(|request| request.working_dir))?;
 
     list_context_files_with_discovered(&working_dir).map_err(|error| error.to_string())
 }
@@ -704,11 +999,8 @@ fn discover_markdown_contexts(
 fn scan_existing_markdown_contexts(
     request: Option<ListContextFilesRequest>,
 ) -> Result<Vec<ContextDiscoveryResult>, String> {
-    let working_dir = request
-        .and_then(|request| request.working_dir)
-        .map(Ok)
-        .unwrap_or_else(std::env::current_dir)
-        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+    let working_dir =
+        resolve_requested_working_dir(request.and_then(|request| request.working_dir))?;
 
     discover_existing_context_file_results(&working_dir).map_err(|error| error.to_string())
 }
@@ -717,11 +1009,8 @@ fn scan_existing_markdown_contexts(
 fn import_markdown_contexts(
     request: Option<ListContextFilesRequest>,
 ) -> Result<Vec<ContextFragment>, String> {
-    let working_dir = request
-        .and_then(|request| request.working_dir)
-        .map(Ok)
-        .unwrap_or_else(std::env::current_dir)
-        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+    let working_dir =
+        resolve_requested_working_dir(request.and_then(|request| request.working_dir))?;
 
     materialize_discovered_context_files(&working_dir).map_err(|error| error.to_string())
 }
@@ -790,24 +1079,26 @@ fn classify_import_markdown(
 }
 
 #[tauri::command]
-fn open_markdown_context(request: OpenMarkdownContextRequest) -> Result<String, String> {
-    let working_dir = request
-        .working_dir
-        .map(Ok)
-        .unwrap_or_else(std::env::current_dir)
-        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+fn open_markdown_context(request: OpenMarkdownContextRequest) -> Result<ContextFragment, String> {
+    let working_dir = resolve_requested_working_dir(request.working_dir)?;
 
-    read_resolved_context_markdown(&working_dir, &request.file_path)
+    read_resolved_context_fragment(&working_dir, &request.file_path)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn open_saved_session_context(
+    request: OpenMarkdownContextRequest,
+) -> Result<SavedSessionHandoffContext, String> {
+    let working_dir = resolve_requested_working_dir(request.working_dir)?;
+
+    read_resolved_session_handoff_context(&working_dir, &request.file_path)
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 fn save_markdown_context(request: SaveMarkdownContextRequest) -> Result<String, String> {
-    let working_dir = request
-        .working_dir
-        .map(Ok)
-        .unwrap_or_else(std::env::current_dir)
-        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+    let working_dir = resolve_requested_working_dir(request.working_dir)?;
 
     update_resolved_context_markdown(&working_dir, &request.file_path, &request.content)
         .map_err(|error| error.to_string())
@@ -817,11 +1108,7 @@ fn save_markdown_context(request: SaveMarkdownContextRequest) -> Result<String, 
 fn review_import_classification(
     request: ReviewImportClassificationRequest,
 ) -> Result<ContextFragment, String> {
-    let working_dir = request
-        .working_dir
-        .map(Ok)
-        .unwrap_or_else(std::env::current_dir)
-        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+    let working_dir = resolve_requested_working_dir(request.working_dir)?;
 
     review_core_import_classification(&working_dir, &request.file_path, request.classification)
         .map_err(format_review_import_classification_error)
@@ -844,11 +1131,7 @@ fn format_review_import_classification_error(error: VaultError) -> String {
 
 #[tauri::command]
 fn delete_markdown_context(request: DeleteMarkdownContextRequest) -> Result<PathBuf, String> {
-    let working_dir = request
-        .working_dir
-        .map(Ok)
-        .unwrap_or_else(std::env::current_dir)
-        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+    let working_dir = resolve_requested_working_dir(request.working_dir)?;
 
     delete_resolved_context_markdown(&working_dir, &request.file_path)
         .map_err(|error| error.to_string())
@@ -862,11 +1145,7 @@ fn poll_context_watch(
         working_dir: None,
         previous_snapshot: None,
     });
-    let working_dir = request
-        .working_dir
-        .map(Ok)
-        .unwrap_or_else(std::env::current_dir)
-        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+    let working_dir = resolve_requested_working_dir(request.working_dir)?;
     let roots = configured_context_watch_roots(&working_dir).map_err(|error| error.to_string())?;
     let snapshot = snapshot_context_directories(&roots).map_err(|error| error.to_string())?;
     let has_previous_snapshot = request.previous_snapshot.is_some();
@@ -891,11 +1170,7 @@ fn poll_context_watch(
 fn lookup_markdown_index(
     request: LookupMarkdownIndexRequest,
 ) -> Result<LookupMarkdownIndexResponse, String> {
-    let working_dir = request
-        .working_dir
-        .map(Ok)
-        .unwrap_or_else(std::env::current_dir)
-        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+    let working_dir = resolve_requested_working_dir(request.working_dir)?;
 
     let file = match request.file_path {
         Some(path) => {
@@ -917,11 +1192,8 @@ fn lookup_markdown_index(
 
 #[tauri::command]
 fn list_presets(request: Option<ListContextFilesRequest>) -> Result<Vec<PresetSummary>, String> {
-    let working_dir = request
-        .and_then(|request| request.working_dir)
-        .map(Ok)
-        .unwrap_or_else(std::env::current_dir)
-        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+    let working_dir =
+        resolve_requested_working_dir(request.and_then(|request| request.working_dir))?;
     let vault = resolve_overlay_vault(&working_dir).map_err(|error| error.to_string())?;
 
     list_presets_from_resolved_overlay(&vault.roots, &vault.contexts, &working_dir)
@@ -933,10 +1205,7 @@ fn save_preset_execution_settings(
     request: PresetExecutionSettingsUpdate,
     working_dir: Option<PathBuf>,
 ) -> Result<PresetSummary, String> {
-    let working_dir = working_dir
-        .map(Ok)
-        .unwrap_or_else(std::env::current_dir)
-        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+    let working_dir = resolve_requested_working_dir(working_dir)?;
     let roots = VaultRoots::discover(&working_dir);
 
     save_core_preset_execution_settings(&roots, request, &working_dir)
@@ -948,10 +1217,7 @@ fn save_preset_subagent_manifest(
     request: SubagentManifestUpdate,
     working_dir: Option<PathBuf>,
 ) -> Result<PresetSummary, String> {
-    let working_dir = working_dir
-        .map(Ok)
-        .unwrap_or_else(std::env::current_dir)
-        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+    let working_dir = resolve_requested_working_dir(working_dir)?;
     let roots = VaultRoots::discover(&working_dir);
 
     save_core_preset_subagent_manifest(&roots, request, &working_dir)
@@ -1007,12 +1273,16 @@ pub fn run() {
             lookup_markdown_index,
             list_presets,
             list_markdown_contexts,
+            list_saved_session_contexts,
             open_markdown_context,
+            open_saved_session_context,
             poll_context_watch,
             probe_ctx_integration,
             preview_ctx_launch,
             read_agent_session,
+            refine_session_context,
             review_import_classification,
+            save_agent_session_context,
             save_markdown_context,
             save_preset_execution_settings,
             save_preset_subagent_manifest,
@@ -1027,18 +1297,23 @@ mod tests {
     use super::{
         classify_import_markdown, create_markdown_context, delete_markdown_context,
         discover_markdown_contexts, import_markdown_contexts, invoke_ctx_integration,
-        list_markdown_contexts, list_presets, open_markdown_context, poll_context_watch,
-        preview_ctx_launch, probe_ctx_integration, review_import_classification,
-        save_markdown_context, save_preset_execution_settings, save_preset_subagent_manifest,
+        list_claude_sessions, list_codex_sessions, list_markdown_contexts, list_presets,
+        list_saved_session_contexts, open_markdown_context, open_saved_session_context,
+        poll_context_watch, preview_ctx_launch, probe_ctx_integration, read_agent_session,
+        review_import_classification, save_agent_session_context, save_markdown_context,
+        save_preset_execution_settings, save_preset_subagent_manifest,
         scan_existing_markdown_contexts, ClassifyImportMarkdownRequest, CreateContextFileRequest,
         CtxIntegrationRequest, DeleteMarkdownContextRequest, ListContextFilesRequest,
-        OpenMarkdownContextRequest, PollContextWatchRequest, ReviewImportClassificationRequest,
+        OpenMarkdownContextRequest, PollContextWatchRequest, ReadAgentSessionRequest,
+        ReviewImportClassificationRequest, SaveAgentSessionContextRequest,
         SaveMarkdownContextRequest,
     };
     use ctx_core::{
-        managed_contexts_dir, managed_presets_dir, CliTarget, ContextFileChangeKind,
-        HandoffConstraints, PresetExecutionSettingsUpdate, SubagentManifest,
-        SubagentManifestUpdate, SubagentRole, VaultScope,
+        create_session_handoff_context_file, managed_contexts_dir, managed_presets_dir,
+        ClassificationStatus, CliTarget, ContextFileChangeKind, HandoffConstraints,
+        InjectionStrategy, PresetExecutionSettingsUpdate, SessionHandoffContext,
+        SessionLogProvider, SubagentManifest, SubagentManifestUpdate, SubagentRole, VaultRoots,
+        VaultScope, WorkContextCategory, WorkContextRefineMode,
     };
     use std::{
         collections::BTreeMap,
@@ -1215,17 +1490,86 @@ mod tests {
     fn open_markdown_context_reads_selected_file_contents() {
         let base = std::env::temp_dir().join(format!("ctx-tauri-open-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&base).expect("test working directory should be created");
-        let file_path = base.join("agent.md");
-        fs::write(&file_path, "# Agent\n\nSelected context body.")
-            .expect("selected context should be writable");
+        let roots = ctx_core::VaultRoots::discover(&base);
+        let created = ctx_core::create_context_file(
+            &roots,
+            VaultScope::Local,
+            "session-history",
+            "claude-open-metadata.md",
+            r#"---
+classification: shared
+tags: [session-history, resume-context, claude, review]
+source_tool: claude
+source_session_ref: "claude-open-metadata"
+source_working_directory: "/tmp/review"
+source_log_path: "/tmp/claude-open-metadata.jsonl"
+work_context_category: review
+work_context_categories: [review, verification]
+work_context_classification_status: classified
+work_context_confidence_score: 84
+work_context_rationale: "Review signals were detected."
+distillation_focus: [findings, verification gaps]
+---
 
-        let content = open_markdown_context(OpenMarkdownContextRequest {
-            file_path,
+# Agent
+
+Selected context body."#,
+        )
+        .expect("selected context should be writable");
+
+        let context = open_markdown_context(OpenMarkdownContextRequest {
+            file_path: created.file_path,
             working_dir: Some(base.clone()),
         })
         .expect("selected markdown context should open");
 
-        assert_eq!(content, "# Agent\n\nSelected context body.");
+        assert!(context.content.contains("Selected context body."));
+        assert_eq!(
+            context.llm_classification_status,
+            ctx_core::ClassificationStatus::Classified
+        );
+        assert!(context
+            .session_handoff_classification
+            .as_ref()
+            .is_some_and(
+                |metadata| metadata.source_session_ref == "claude-open-metadata"
+                    && metadata.work_context_category == "review"
+            ));
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn read_agent_session_returns_classification_metadata() {
+        let base =
+            std::env::temp_dir().join(format!("ctx-tauri-session-read-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&base).expect("test working directory should be created");
+        let session_path = base.join("codex-read-metadata.jsonl");
+        fs::write(
+            &session_path,
+            codex_session_log(
+                "codex-read-metadata",
+                "Implement session handoff launch flow and verify cleanup",
+            ),
+        )
+        .expect("session log should be writable");
+
+        let detail = read_agent_session(ReadAgentSessionRequest {
+            provider: "codex".to_string(),
+            file_path: session_path.clone(),
+        })
+        .expect("session detail should load with classification metadata");
+
+        assert_eq!(detail.summary.session_id, "codex-read-metadata");
+        assert_eq!(detail.classification_metadata.source_tool, "codex");
+        assert_eq!(
+            detail.classification_metadata.source_session_ref,
+            "codex-read-metadata"
+        );
+        assert!(!detail
+            .classification_metadata
+            .work_context_category
+            .is_empty());
+        assert!(detail.classification_metadata.work_context_confidence_score > 0);
         fs::remove_dir_all(base).ok();
     }
 
@@ -1248,6 +1592,452 @@ mod tests {
             fs::read_to_string(&file_path).expect("saved context should be readable"),
             "# Agent\n\nUpdated body."
         );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn save_agent_session_context_writes_classification_metadata() {
+        let base =
+            std::env::temp_dir().join(format!("ctx-tauri-session-save-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&base).expect("test working directory should be created");
+        let session_path = base.join("codex-save-metadata.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"timestamp":"2026-05-11T00:00:00Z","type":"session_meta","payload":{"id":"codex-save-metadata","cwd":"/tmp/project","timestamp":"2026-05-11T00:00:00Z"}}
+{"timestamp":"2026-05-11T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Implement session handoff launch flow and verify cleanup"}}
+{"timestamp":"2026-05-11T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Summary: Implemented launch handoff.\nChanged files: src-tauri/src/lib.rs.\nDecision: Persist distilled session fields when saving.\nVerified with cargo test -p ctx-tauri save_agent_session_context_writes_classification_metadata.\nRemaining work: launch saved entries."}}
+"#,
+        )
+        .expect("session log should be writable");
+
+        let context = save_agent_session_context(SaveAgentSessionContextRequest {
+            provider: "codex".to_string(),
+            file_path: session_path.clone(),
+            content: "---\ntags: [old]\n---\n\n# Previous Session Context\n\n## Handoff Summary\n\nImplemented launch handoff.\n\n### Goals\n\n- Implement session handoff launch flow and verify cleanup\n\n### Key changed files\n\n- src-tauri/src/lib.rs\n\n### Decisions\n\n- Persist distilled session fields when saving.\n\n### Verification results\n\n- Verified with cargo test -p ctx-tauri save_agent_session_context_writes_classification_metadata.\n\n### Remaining work\n\n- launch saved entries."
+                .to_string(),
+            working_dir: Some(base.clone()),
+        })
+        .expect("session handoff should save");
+
+        let saved =
+            fs::read_to_string(&context.file_path).expect("saved handoff should be readable");
+        assert!(saved.contains("source_tool: codex"));
+        assert!(saved.contains("source_session_ref: \"codex-save-metadata\""));
+        assert!(saved.contains("work_context_classification_status: classified"));
+        assert!(saved.contains("work_context_categories: ["));
+        assert!(saved.contains("distillation_focus: ["));
+        assert!(saved.contains("session_handoff_format_version: 1"));
+        assert!(saved.contains("summary: \"Implemented launch handoff.\""));
+        assert!(saved.contains("key_changed_files: [\"src-tauri/src/lib.rs\"]"));
+        assert!(saved.contains("decisions: [\"Persist distilled session fields when saving.\"]"));
+        assert!(saved.contains("remaining_work: [\"launch saved entries.\"]"));
+        assert!(saved.contains("launch_target: codex"));
+        assert!(saved.contains("injection_method: agents-md-section-marker-merge"));
+        assert!(!saved.contains("tags: [old]"));
+
+        let reloaded = list_markdown_contexts(Some(ListContextFilesRequest {
+            working_dir: Some(base.clone()),
+        }))
+        .expect("saved contexts should reload")
+        .into_iter()
+        .find(|reloaded| reloaded.file_path == context.file_path)
+        .expect("saved session context should be listed");
+
+        assert_eq!(
+            reloaded.llm_classification_status,
+            ctx_core::ClassificationStatus::Classified
+        );
+        assert!(reloaded
+            .session_handoff_classification
+            .as_ref()
+            .is_some_and(|metadata| metadata.source_session_ref == "codex-save-metadata"));
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn save_agent_session_context_maps_distilled_content_into_handoff_fields() {
+        let base = std::env::temp_dir().join(format!(
+            "ctx-tauri-session-save-distilled-map-test-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&base).expect("test working directory should be created");
+        let session_path = base.join("codex-save-distilled-map.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"timestamp":"2026-05-11T00:00:00Z","type":"session_meta","payload":{"id":"codex-save-distilled-map","cwd":"/tmp/project","timestamp":"2026-05-11T00:00:00Z"}}
+{"timestamp":"2026-05-11T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Original request before refinement"}}
+{"timestamp":"2026-05-11T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Summary: Original raw scan summary.\nChanged files: crates/ctx-core/src/session_logs.rs.\nDecision: Original raw decision.\nVerified with original raw check.\nRemaining work: Original raw follow-up."}}
+"#,
+        )
+        .expect("session log should be writable");
+
+        let context = save_agent_session_context(SaveAgentSessionContextRequest {
+            provider: "codex".to_string(),
+            file_path: session_path,
+            content: "# Previous Session Context\n\n## Handoff Summary\n\nDistilled save flow now persists the reviewed handoff body.\n\n### Goals\n\n- Save distilled scan output with classification metadata\n\n### Key changed files\n\n- crates/ctx-core/src/work_context.rs\n\n### Decisions\n\n- Use sectioned distilled content for reusable handoff fields.\n\n### Verification results\n\n- cargo test -p ctx-tauri save_agent_session_context_maps_distilled_content_into_handoff_fields\n\n### Remaining work\n\n- Launch saved entries with automatic injection."
+                .to_string(),
+            working_dir: Some(base.clone()),
+        })
+        .expect("session handoff should save from distilled content");
+
+        let saved =
+            fs::read_to_string(&context.file_path).expect("saved handoff should be readable");
+        assert!(saved.contains("source_tool: codex"));
+        assert!(saved.contains("source_session_ref: \"codex-save-distilled-map\""));
+        assert!(saved
+            .contains("summary: \"Distilled save flow now persists the reviewed handoff body.\""));
+        assert!(
+            saved.contains("goals: [\"Save distilled scan output with classification metadata\"]")
+        );
+        assert!(saved.contains("key_changed_files: [\"crates/ctx-core/src/work_context.rs\"]"));
+        assert!(saved.contains(
+            "decisions: [\"Use sectioned distilled content for reusable handoff fields.\"]"
+        ));
+        assert!(saved.contains("verification_results: [\"cargo test -p ctx-tauri save_agent_session_context_maps_distilled_content_into_handoff_fields\"]"));
+        assert!(
+            saved.contains("remaining_work: [\"Launch saved entries with automatic injection.\"]")
+        );
+        assert!(!saved.contains("Original raw scan summary."));
+        assert!(!saved.contains("Original raw decision."));
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn save_agent_session_context_rejects_incomplete_distilled_context_before_persistence() {
+        let base = std::env::temp_dir().join(format!(
+            "ctx-tauri-session-save-validation-test-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&base).expect("test working directory should be created");
+        let session_path = base.join("codex-save-validation.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"timestamp":"2026-05-11T00:00:00Z","type":"session_meta","payload":{"id":"codex-save-validation","cwd":"/tmp/project","timestamp":"2026-05-11T00:00:00Z"}}
+{"timestamp":"2026-05-11T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Implement session handoff launch flow and verify cleanup"}}
+{"timestamp":"2026-05-11T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Summary: Implemented launch handoff.\nChanged files: src-tauri/src/lib.rs.\nDecision: Validate distilled handoff fields before saving.\nVerified with cargo test -p ctx-tauri save_agent_session_context_rejects_incomplete_distilled_context_before_persistence.\nRemaining work: launch saved entries."}}
+"#,
+        )
+        .expect("session log should be writable");
+
+        let error = save_agent_session_context(SaveAgentSessionContextRequest {
+            provider: "codex".to_string(),
+            file_path: session_path,
+            content:
+                "# Previous Session Context\n\n## Handoff Summary\n\nImplemented launch handoff."
+                    .to_string(),
+            working_dir: Some(base.clone()),
+        })
+        .expect_err("incomplete distilled handoff content should be rejected");
+
+        assert!(error.contains("invalid distilled session handoff context"));
+        assert!(error.contains("lost essential distilled field"));
+        assert!(!base.join(".ctx").exists());
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn save_agent_session_context_validation_error_does_not_mutate_existing_handoff() {
+        let base = std::env::temp_dir().join(format!(
+            "ctx-tauri-session-save-validation-mutation-test-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&base).expect("test working directory should be created");
+        let session_path = base.join("codex-save-validation-mutation.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"timestamp":"2026-05-11T00:00:00Z","type":"session_meta","payload":{"id":"codex-save-validation-mutation","cwd":"/tmp/project","timestamp":"2026-05-11T00:00:00Z"}}
+{"timestamp":"2026-05-11T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Implement session handoff launch flow and verify cleanup"}}
+{"timestamp":"2026-05-11T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Summary: Implemented launch handoff.\nChanged files: src-tauri/src/lib.rs.\nDecision: Validate distilled handoff fields before saving.\nVerified with cargo test -p ctx-tauri save_agent_session_context_validation_error_does_not_mutate_existing_handoff.\nRemaining work: launch saved entries."}}
+"#,
+        )
+        .expect("session log should be writable");
+
+        let saved = save_agent_session_context(SaveAgentSessionContextRequest {
+            provider: "codex".to_string(),
+            file_path: session_path.clone(),
+            content: "# Previous Session Context\n\n## Handoff Summary\n\nImplemented launch handoff.\n\n### Goals\n\n- Implement session handoff launch flow and verify cleanup\n\n### Key changed files\n\n- src-tauri/src/lib.rs\n\n### Decisions\n\n- Validate distilled handoff fields before saving.\n\n### Verification results\n\n- Verified with cargo test -p ctx-tauri save_agent_session_context_validation_error_does_not_mutate_existing_handoff.\n\n### Remaining work\n\n- launch saved entries."
+                .to_string(),
+            working_dir: Some(base.clone()),
+        })
+        .expect("complete session handoff should save");
+        let saved_content_before =
+            fs::read_to_string(&saved.file_path).expect("saved handoff should be readable");
+
+        let error = save_agent_session_context(SaveAgentSessionContextRequest {
+            provider: "codex".to_string(),
+            file_path: session_path,
+            content:
+                "# Previous Session Context\n\n## Handoff Summary\n\nImplemented launch handoff."
+                    .to_string(),
+            working_dir: Some(base.clone()),
+        })
+        .expect_err("validation failure should be returned to the caller");
+
+        let saved_content_after =
+            fs::read_to_string(&saved.file_path).expect("saved handoff should remain readable");
+        let listed = list_saved_session_contexts(Some(ListContextFilesRequest {
+            working_dir: Some(base.clone()),
+        }))
+        .expect("saved context list should remain readable after validation failure");
+
+        assert!(error.contains("invalid distilled session handoff context"));
+        assert!(error.contains("lost essential distilled field"));
+        assert_eq!(saved_content_after, saved_content_before);
+        assert_eq!(
+            listed
+                .iter()
+                .filter(|context| context.fragment.file_path == saved.file_path)
+                .count(),
+            1
+        );
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn saved_session_context_detail_apis_return_full_handoff_schema_with_empty_values() {
+        let base =
+            std::env::temp_dir().join(format!("ctx-tauri-saved-detail-test-{}", Uuid::new_v4()));
+        let home = base.join("home");
+        let working_dir = base.join("project");
+        let roots = VaultRoots {
+            global_root: home
+                .join(ctx_core::CTX_HOME_DIR)
+                .join(ctx_core::GLOBAL_VAULT_DIR),
+            local_root: Some(
+                working_dir
+                    .join(ctx_core::CTX_HOME_DIR)
+                    .join(ctx_core::GLOBAL_VAULT_DIR),
+            ),
+        };
+        let handoff = SessionHandoffContext {
+            source_tool: SessionLogProvider::Claude,
+            source_session_ref: "claude-empty-fields".to_string(),
+            source_working_directory: "/tmp/session-project".to_string(),
+            source_log_path: "/tmp/claude-empty-fields.jsonl".to_string(),
+            source_updated_at: None,
+            title: "Preserve empty distilled fields".to_string(),
+            category: WorkContextCategory::General,
+            categories: vec![WorkContextCategory::General],
+            classification_status: ClassificationStatus::Classified,
+            classification_confidence_score: 77,
+            classification_rationale: "General session handoff signals were detected.".to_string(),
+            goals: Vec::new(),
+            summary: "Documented a minimal saved session handoff.".to_string(),
+            key_changed_files: Vec::new(),
+            commands: Vec::new(),
+            decisions: Vec::new(),
+            verification_results: Vec::new(),
+            remaining_work: Vec::new(),
+            created_at: "2026-05-11T00:00:00Z".to_string(),
+            handoff_markdown: "# Previous Session Context\n\n## Summary\n\nDocumented a minimal saved session handoff.\n\n## Notes\n\n- No key files were captured.\n- No decisions were captured.\n- No verification commands were captured."
+                .to_string(),
+            tags: vec![
+                "session-history".to_string(),
+                "resume-context".to_string(),
+                "claude".to_string(),
+                "general".to_string(),
+            ],
+            cleanup_applied: false,
+            refine_mode: WorkContextRefineMode::Refined,
+            launch_target: CliTarget::Claude,
+            injection_method: InjectionStrategy::AppendSystemPromptFile,
+        };
+
+        let saved = create_session_handoff_context_file(
+            &roots,
+            VaultScope::Local,
+            "session-history",
+            "claude-empty-fields.md",
+            &handoff,
+        )
+        .expect("minimal session handoff should persist");
+
+        with_home(&home, || {
+            let listed = list_saved_session_contexts(Some(ListContextFilesRequest {
+                working_dir: Some(working_dir.clone()),
+            }))
+            .expect("saved session list API should return structured handoff entries");
+            let listed_entry = listed
+                .iter()
+                .find(|entry| entry.fragment.file_path == saved.fragment.file_path)
+                .expect("saved session should be listed");
+
+            assert_eq!(listed_entry.handoff, handoff);
+            assert!(listed_entry.handoff.source_updated_at.is_none());
+            assert!(listed_entry.handoff.key_changed_files.is_empty());
+            assert!(listed_entry.handoff.commands.is_empty());
+            assert!(listed_entry.handoff.decisions.is_empty());
+            assert!(listed_entry.handoff.verification_results.is_empty());
+            assert!(listed_entry.handoff.remaining_work.is_empty());
+            assert_eq!(
+                listed_entry.handoff.refine_mode,
+                WorkContextRefineMode::Refined
+            );
+            assert_eq!(
+                listed_entry.handoff.injection_method,
+                InjectionStrategy::AppendSystemPromptFile
+            );
+            assert_eq!(
+                listed_entry
+                    .fragment
+                    .session_handoff_classification
+                    .as_ref()
+                    .expect("fragment metadata should still be hydrated")
+                    .source_session_ref,
+                "claude-empty-fields"
+            );
+
+            let list_json = serde_json::to_value(&listed)
+                .expect("saved session list response should serialize for the API");
+            let listed_json_entry = list_json
+                .as_array()
+                .expect("saved session list response should be an array")
+                .iter()
+                .find(|entry| {
+                    entry["fragment"]["file_path"]
+                        == serde_json::json!(saved.fragment.file_path.to_string_lossy())
+                })
+                .expect("saved session should be present in serialized list response");
+
+            assert_eq!(
+                listed_json_entry["fragment"]["title"],
+                "claude empty fields"
+            );
+            assert_eq!(
+                listed_json_entry["fragment"]["vault_scope"],
+                serde_json::json!("local")
+            );
+            assert_eq!(
+                listed_json_entry["fragment"]["tags"],
+                serde_json::json!(["session-history", "resume-context", "claude", "general"])
+            );
+            assert_eq!(
+                listed_json_entry["fragment"]["llm_classification_status"],
+                serde_json::json!("classified")
+            );
+            assert_eq!(
+                listed_json_entry["fragment"]["session_handoff_classification"]["sourceSessionRef"],
+                "claude-empty-fields"
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["source_tool"],
+                serde_json::json!("claude")
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["source_session_ref"],
+                "claude-empty-fields"
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["source_working_directory"],
+                "/tmp/session-project"
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["source_log_path"],
+                "/tmp/claude-empty-fields.jsonl"
+            );
+            assert!(listed_json_entry["handoff"]["source_updated_at"].is_null());
+            assert_eq!(
+                listed_json_entry["handoff"]["title"],
+                "Preserve empty distilled fields"
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["category"],
+                serde_json::json!("general")
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["categories"],
+                serde_json::json!(["general"])
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["classification_status"],
+                serde_json::json!("classified")
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["classification_confidence_score"],
+                serde_json::json!(77)
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["classification_rationale"],
+                "General session handoff signals were detected."
+            );
+            assert_eq!(listed_json_entry["handoff"]["goals"], serde_json::json!([]));
+            assert_eq!(
+                listed_json_entry["handoff"]["summary"],
+                "Documented a minimal saved session handoff."
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["key_changed_files"],
+                serde_json::json!([])
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["commands"],
+                serde_json::json!([])
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["decisions"],
+                serde_json::json!([])
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["verification_results"],
+                serde_json::json!([])
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["remaining_work"],
+                serde_json::json!([])
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["created_at"],
+                "2026-05-11T00:00:00Z"
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["handoff_markdown"],
+                "# Previous Session Context\n\n## Summary\n\nDocumented a minimal saved session handoff.\n\n## Notes\n\n- No key files were captured.\n- No decisions were captured.\n- No verification commands were captured."
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["tags"],
+                serde_json::json!(["session-history", "resume-context", "claude", "general"])
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["cleanup_applied"],
+                serde_json::json!(false)
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["refine_mode"],
+                serde_json::json!("refined")
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["launch_target"],
+                serde_json::json!("claude")
+            );
+            assert_eq!(
+                listed_json_entry["handoff"]["injection_method"],
+                serde_json::json!("append-system-prompt-file")
+            );
+
+            let detail = open_saved_session_context(OpenMarkdownContextRequest {
+                file_path: saved.fragment.file_path.clone(),
+                working_dir: Some(working_dir.clone()),
+            })
+            .expect("saved session detail API should return structured handoff entry");
+            assert_eq!(detail.handoff, handoff);
+
+            let json = serde_json::to_value(&detail)
+                .expect("saved session detail response should serialize for the API");
+            assert!(json["handoff"]["source_updated_at"].is_null());
+            assert_eq!(json["handoff"]["key_changed_files"], serde_json::json!([]));
+            assert_eq!(json["handoff"]["commands"], serde_json::json!([]));
+            assert_eq!(json["handoff"]["decisions"], serde_json::json!([]));
+            assert_eq!(
+                json["handoff"]["verification_results"],
+                serde_json::json!([])
+            );
+            assert_eq!(json["handoff"]["remaining_work"], serde_json::json!([]));
+            assert_eq!(
+                json["handoff"]["handoff_markdown"],
+                "# Previous Session Context\n\n## Summary\n\nDocumented a minimal saved session handoff.\n\n## Notes\n\n- No key files were captured.\n- No decisions were captured.\n- No verification commands were captured."
+            );
+        });
+
         fs::remove_dir_all(base).ok();
     }
 
@@ -1383,6 +2173,7 @@ mod tests {
                         description: Some(" Find correctness risks. ".to_string()),
                         assigned_contexts: vec![" subagents/reviewer.md ".to_string()],
                         spawn_instructions: vec![" Review the active patch. ".to_string()],
+                        spawn_guidance: Default::default(),
                         handoff_targets: vec![" implementer ".to_string()],
                         model: Some(" gpt-5.3-codex ".to_string()),
                     }],
@@ -1468,6 +2259,7 @@ mod tests {
                         description: None,
                         assigned_contexts: vec!["/tmp/secret.md".to_string()],
                         spawn_instructions: Vec::new(),
+                        spawn_guidance: Default::default(),
                         handoff_targets: Vec::new(),
                         model: None,
                     }],
@@ -1511,6 +2303,111 @@ mod tests {
             && context.file_name == "review.md"
             && context.root_source == base
             && context.metadata.tags.contains(&"skills".to_string())));
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn list_codex_sessions_enumerates_readable_logs_from_discovered_roots() {
+        let base =
+            std::env::temp_dir().join(format!("ctx-tauri-codex-session-scan-{}", Uuid::new_v4()));
+        let home = base.join("home");
+        let project = base.join("project");
+        let default_log_dir = home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("11");
+        let configured_log_dir = project.join("project-codex-sessions").join("nested");
+        let local_vault = project.join(".ctx").join("vault");
+
+        fs::create_dir_all(&default_log_dir).expect("default Codex log dir should be created");
+        fs::create_dir_all(&configured_log_dir)
+            .expect("configured Codex log dir should be created");
+        fs::create_dir_all(&local_vault).expect("local vault should be created");
+        fs::write(
+            local_vault.join("settings.json"),
+            r#"{"codex_session_roots":[{"path":"project-codex-sessions","scope":"local"}]}"#,
+        )
+        .expect("local settings should be writable");
+        fs::write(
+            default_log_dir.join("default.jsonl"),
+            codex_session_log("default-session", "Default Codex work"),
+        )
+        .expect("default Codex session log should be writable");
+        fs::write(
+            configured_log_dir.join("configured.jsonl"),
+            codex_session_log("configured-session", "Configured Codex work"),
+        )
+        .expect("configured Codex session log should be writable");
+        fs::write(configured_log_dir.join("notes.txt"), "not a session")
+            .expect("non-jsonl file should be writable");
+
+        with_home(&home, || {
+            let sessions = list_codex_sessions(&home, &project)
+                .expect("Codex sessions should be listed from discovered roots");
+            let session_ids = sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>();
+
+            assert_eq!(sessions.len(), 2);
+            assert!(session_ids.contains(&"default-session"));
+            assert!(session_ids.contains(&"configured-session"));
+            assert!(sessions.iter().all(|session| session.provider == "codex"));
+        });
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn list_claude_sessions_uses_shared_scanner_metadata() {
+        let base =
+            std::env::temp_dir().join(format!("ctx-tauri-claude-session-scan-{}", Uuid::new_v4()));
+        let home = base.join("home");
+        let project = base.join("project");
+        let default_log_dir = home.join(".claude").join("projects").join("project-a");
+        let local_vault = project.join(".ctx").join("vault");
+        let configured_log_dir = project.join("project-claude-sessions");
+
+        fs::create_dir_all(&default_log_dir).expect("default Claude log dir should be created");
+        fs::create_dir_all(&configured_log_dir)
+            .expect("configured Claude log dir should be created");
+        fs::create_dir_all(&local_vault).expect("local vault should be created");
+        fs::write(
+            local_vault.join("settings.json"),
+            r#"{"claude_session_roots":[{"path":"project-claude-sessions","scope":"local"}]}"#,
+        )
+        .expect("local settings should be writable");
+        fs::write(
+            default_log_dir.join("default.jsonl"),
+            r#"{"type":"system","sessionId":"default-claude","cwd":"/tmp/default","timestamp":"2026-05-11T00:00:00Z"}"#,
+        )
+        .expect("default Claude log should be writable");
+        fs::write(
+            configured_log_dir.join("configured.jsonl"),
+            r#"{"sessionId":"configured-claude","cwd":"/tmp/configured","timestamp":"2026-05-11T00:00:01Z","type":"user","message":{"role":"user","content":"Configured Claude work"}}"#,
+        )
+        .expect("configured Claude log should be writable");
+
+        with_home(&home, || {
+            let sessions = list_claude_sessions(&home, &project)
+                .expect("Claude sessions should be listed from shared scanner roots");
+            let session_ids = sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>();
+
+            assert_eq!(sessions.len(), 2);
+            assert!(session_ids.contains(&"default-claude"));
+            assert!(session_ids.contains(&"configured-claude"));
+            assert!(sessions.iter().all(|session| session.provider == "claude"));
+            assert!(sessions
+                .iter()
+                .any(|session| session.title == "Configured Claude work"
+                    && session.cwd.as_deref() == Some("/tmp/configured")));
+        });
+
         fs::remove_dir_all(base).ok();
     }
 
@@ -1687,7 +2584,7 @@ mod tests {
             assert_eq!(contexts[0].vault_scope, VaultScope::Local);
             assert_eq!(contexts[0].file_path, local.file_path);
             assert_eq!(contexts[0].content, "# Local App Rules");
-            assert_eq!(content, "# Local App Rules");
+            assert_eq!(content.content, "# Local App Rules");
             assert!(global_error.contains("resolved vault overlay"));
         });
 
@@ -1726,7 +2623,7 @@ mod tests {
             assert_eq!(contexts.len(), 1);
             assert_eq!(contexts[0].vault_scope, VaultScope::Global);
             assert_eq!(contexts[0].file_path, global.file_path);
-            assert_eq!(content, "# Global App Fallback");
+            assert_eq!(content.content, "# Global App Fallback");
         });
 
         fs::remove_dir_all(base).ok();
@@ -1862,5 +2759,13 @@ mod tests {
             Some(value) => env::set_var("HOME", value),
             None => env::remove_var("HOME"),
         }
+    }
+
+    fn codex_session_log(session_id: &str, user_message: &str) -> String {
+        format!(
+            r#"{{"timestamp":"2026-05-11T00:00:00Z","type":"session_meta","payload":{{"id":"{session_id}","cwd":"/tmp/project","timestamp":"2026-05-11T00:00:00Z"}}}}
+{{"timestamp":"2026-05-11T00:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":"{user_message}"}}}}
+"#
+        )
     }
 }

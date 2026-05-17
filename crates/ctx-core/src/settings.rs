@@ -16,6 +16,8 @@ pub struct VaultSettings {
     pub auto_classification_enabled: Option<bool>,
     pub scan_roots: Option<Vec<ScanRootConfig>>,
     pub skill_scan_roots: Option<Vec<ScanRootConfig>>,
+    pub claude_session_roots: Option<Vec<ScanRootConfig>>,
+    pub codex_session_roots: Option<Vec<ScanRootConfig>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -45,6 +47,18 @@ pub struct ResolvedVaultSettings {
 pub struct VaultSettingsSource {
     pub path: PathBuf,
     pub scope: VaultScope,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum SessionLogRootSource {
+    KnownDefault,
+    VaultSettings { path: PathBuf, scope: VaultScope },
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ResolvedSessionLogRoot {
+    pub path: PathBuf,
+    pub source: SessionLogRootSource,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -107,6 +121,74 @@ pub fn load_configured_skill_scan_roots(
     working_dir: &Path,
 ) -> Result<Vec<ConfiguredScanRoot>, VaultSettingsError> {
     load_configured_roots_from_field(roots, working_dir, ScanRootField::Skill)
+}
+
+pub fn resolve_claude_session_log_roots(
+    roots: &VaultRoots,
+    working_dir: &Path,
+    home_dir: &Path,
+) -> Result<Vec<ResolvedSessionLogRoot>, VaultSettingsError> {
+    resolve_session_log_roots(
+        roots,
+        working_dir,
+        SessionLogRootField::Claude,
+        home_dir.join(".claude").join("projects"),
+    )
+}
+
+pub fn resolve_codex_session_log_roots(
+    roots: &VaultRoots,
+    working_dir: &Path,
+    home_dir: &Path,
+) -> Result<Vec<ResolvedSessionLogRoot>, VaultSettingsError> {
+    resolve_session_log_roots(
+        roots,
+        working_dir,
+        SessionLogRootField::Codex,
+        home_dir.join(".codex").join("sessions"),
+    )
+}
+
+fn resolve_session_log_roots(
+    roots: &VaultRoots,
+    working_dir: &Path,
+    field: SessionLogRootField,
+    default_path: PathBuf,
+) -> Result<Vec<ResolvedSessionLogRoot>, VaultSettingsError> {
+    let mut session_roots = Vec::new();
+    let mut seen = HashSet::new();
+
+    push_existing_session_log_root(
+        default_path,
+        field,
+        SessionLogRootSource::KnownDefault,
+        &mut seen,
+        &mut session_roots,
+    )?;
+
+    collect_session_roots_from_settings_file(
+        vault_settings_path(&roots.global_root),
+        VaultScope::Global,
+        &roots.global_root,
+        working_dir,
+        field,
+        &mut seen,
+        &mut session_roots,
+    )?;
+
+    if let Some(local_root) = &roots.local_root {
+        collect_session_roots_from_settings_file(
+            vault_settings_path(local_root),
+            VaultScope::Local,
+            local_root,
+            working_dir,
+            field,
+            &mut seen,
+            &mut session_roots,
+        )?;
+    }
+
+    Ok(session_roots)
 }
 
 fn load_configured_roots_from_field(
@@ -200,6 +282,12 @@ fn merge_settings(base: &mut VaultSettings, overlay: VaultSettings) {
     }
     if overlay.skill_scan_roots.is_some() {
         base.skill_scan_roots = overlay.skill_scan_roots;
+    }
+    if overlay.claude_session_roots.is_some() {
+        base.claude_session_roots = overlay.claude_session_roots;
+    }
+    if overlay.codex_session_roots.is_some() {
+        base.codex_session_roots = overlay.codex_session_roots;
     }
 }
 
@@ -315,11 +403,145 @@ fn expand_scan_root_path(path: &Path, base_dir: &Path) -> PathBuf {
     base_dir.join(path)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionLogRootField {
+    Claude,
+    Codex,
+}
+
+impl SessionLogRootField {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude session log root",
+            Self::Codex => "Codex session log root",
+        }
+    }
+}
+
+fn collect_session_roots_from_settings_file(
+    path: PathBuf,
+    scope: VaultScope,
+    vault_root: &Path,
+    working_dir: &Path,
+    field: SessionLogRootField,
+    seen: &mut HashSet<PathBuf>,
+    session_roots: &mut Vec<ResolvedSessionLogRoot>,
+) -> Result<(), VaultSettingsError> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&path).map_err(|error| {
+        VaultSettingsError::Io(format!(
+            "failed to read vault settings file {}: {error}",
+            path.display()
+        ))
+    })?;
+    let settings: VaultSettings = serde_json::from_str(&content).map_err(|error| {
+        VaultSettingsError::Parse(format!(
+            "failed to parse vault settings file {} as JSON: {error}",
+            path.display()
+        ))
+    })?;
+
+    let configured_roots = match field {
+        SessionLogRootField::Claude => settings.claude_session_roots,
+        SessionLogRootField::Codex => settings.codex_session_roots,
+    };
+    let Some(configured_roots) = configured_roots else {
+        return Ok(());
+    };
+
+    let base_dir = scan_root_base_dir(vault_root, working_dir);
+    for configured_root in configured_roots {
+        let expanded_path = expand_scan_root_path(configured_root.path(), &base_dir);
+        push_existing_session_log_root(
+            expanded_path,
+            field,
+            SessionLogRootSource::VaultSettings {
+                path: path.clone(),
+                scope,
+            },
+            seen,
+            session_roots,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn push_existing_session_log_root(
+    path: PathBuf,
+    field: SessionLogRootField,
+    source: SessionLogRootSource,
+    seen: &mut HashSet<PathBuf>,
+    session_roots: &mut Vec<ResolvedSessionLogRoot>,
+) -> Result<(), VaultSettingsError> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let canonical_path = match path.canonicalize() {
+        Ok(canonical_path) => canonical_path,
+        Err(_) if field == SessionLogRootField::Codex => return Ok(()),
+        Err(error) => {
+            return Err(VaultSettingsError::InvalidScanRoot(format!(
+                "{} {} is not accessible: {error}",
+                field.label(),
+                path.display()
+            )));
+        }
+    };
+    let metadata = match fs::metadata(&canonical_path) {
+        Ok(metadata) => metadata,
+        Err(_) if field == SessionLogRootField::Codex => return Ok(()),
+        Err(error) => {
+            return Err(VaultSettingsError::InvalidScanRoot(format!(
+                "{} {} cannot be inspected: {error}",
+                field.label(),
+                canonical_path.display()
+            )));
+        }
+    };
+
+    if !metadata.is_dir() {
+        if field == SessionLogRootField::Codex {
+            return Ok(());
+        }
+        return Err(VaultSettingsError::InvalidScanRoot(format!(
+            "{} {} is not a directory",
+            field.label(),
+            canonical_path.display()
+        )));
+    }
+
+    if let Err(error) = fs::read_dir(&canonical_path) {
+        if field == SessionLogRootField::Codex {
+            return Ok(());
+        }
+        return Err(VaultSettingsError::InvalidScanRoot(format!(
+            "{} {} is not readable: {error}",
+            field.label(),
+            canonical_path.display()
+        )));
+    }
+
+    if seen.insert(canonical_path.clone()) {
+        session_roots.push(ResolvedSessionLogRoot {
+            path: canonical_path,
+            source,
+        });
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         load_configured_scan_roots, load_configured_skill_scan_roots, load_vault_settings_overlay,
-        vault_settings_path, VAULT_SETTINGS_FILE_NAME,
+        resolve_claude_session_log_roots, resolve_codex_session_log_roots, vault_settings_path,
+        SessionLogRootSource, VAULT_SETTINGS_FILE_NAME,
     };
     use crate::{CliTarget, VaultRoots, VaultScope};
     use std::fs;
@@ -516,6 +738,213 @@ mod tests {
                 .expect("local skill root should canonicalize")
         );
         assert_eq!(scan_roots[1].scope, VaultScope::Local);
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn resolves_claude_session_log_roots_from_default_and_settings() {
+        let base =
+            std::env::temp_dir().join(format!("ctx-claude-session-roots-{}", Uuid::new_v4()));
+        let roots = VaultRoots {
+            global_root: base.join("home").join(".ctx").join("vault"),
+            local_root: Some(base.join("project").join(".ctx").join("vault")),
+        };
+        let home_dir = base.join("home");
+        let default_root = home_dir.join(".claude").join("projects");
+        let global_root = base.join("home").join("extra-claude-sessions");
+        let local_root = base.join("project").join("project-claude-sessions");
+
+        fs::create_dir_all(&roots.global_root).expect("global vault root should be created");
+        fs::create_dir_all(roots.local_root.as_ref().unwrap())
+            .expect("local vault root should be created");
+        fs::create_dir_all(&default_root).expect("default Claude root should be created");
+        fs::create_dir_all(&global_root).expect("global Claude root should be created");
+        fs::create_dir_all(&local_root).expect("local Claude root should be created");
+
+        fs::write(
+            vault_settings_path(&roots.global_root),
+            r#"{"claude_session_roots":["extra-claude-sessions"]}"#,
+        )
+        .expect("global settings should be writable");
+        fs::write(
+            vault_settings_path(roots.local_root.as_ref().unwrap()),
+            r#"{"claude_session_roots":[{"path":"project-claude-sessions"}]}"#,
+        )
+        .expect("local settings should be writable");
+
+        let session_roots =
+            resolve_claude_session_log_roots(&roots, &base.join("project"), &home_dir)
+                .expect("Claude session log roots should resolve");
+
+        assert_eq!(session_roots.len(), 3);
+        assert_eq!(
+            session_roots[0].path,
+            default_root
+                .canonicalize()
+                .expect("default root should canonicalize")
+        );
+        assert_eq!(session_roots[0].source, SessionLogRootSource::KnownDefault);
+        assert_eq!(
+            session_roots[1].path,
+            global_root
+                .canonicalize()
+                .expect("global root should canonicalize")
+        );
+        assert_eq!(
+            session_roots[1].source,
+            SessionLogRootSource::VaultSettings {
+                path: vault_settings_path(&roots.global_root),
+                scope: VaultScope::Global,
+            }
+        );
+        assert_eq!(
+            session_roots[2].path,
+            local_root
+                .canonicalize()
+                .expect("local root should canonicalize")
+        );
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn resolves_claude_session_log_roots_deduplicating_missing_and_overlapping_paths() {
+        let base = std::env::temp_dir().join(format!(
+            "ctx-claude-session-roots-dedupe-{}",
+            Uuid::new_v4()
+        ));
+        let roots = VaultRoots {
+            global_root: base.join("home").join(".ctx").join("vault"),
+            local_root: None,
+        };
+        let home_dir = base.join("home");
+        let default_root = home_dir.join(".claude").join("projects");
+
+        fs::create_dir_all(&roots.global_root).expect("global vault root should be created");
+        fs::create_dir_all(&default_root).expect("default Claude root should be created");
+        fs::write(
+            vault_settings_path(&roots.global_root),
+            r#"{"claude_session_roots":[".claude/projects","missing-claude-sessions"]}"#,
+        )
+        .expect("global settings should be writable");
+
+        let session_roots = resolve_claude_session_log_roots(&roots, &base, &home_dir)
+            .expect("Claude session log roots should resolve");
+
+        assert_eq!(session_roots.len(), 1);
+        assert_eq!(
+            session_roots[0].path,
+            default_root
+                .canonicalize()
+                .expect("default root should canonicalize")
+        );
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn resolves_codex_session_log_roots_from_default_and_settings() {
+        let base = std::env::temp_dir().join(format!("ctx-codex-session-roots-{}", Uuid::new_v4()));
+        let roots = VaultRoots {
+            global_root: base.join("home").join(".ctx").join("vault"),
+            local_root: Some(base.join("project").join(".ctx").join("vault")),
+        };
+        let home_dir = base.join("home");
+        let default_root = home_dir.join(".codex").join("sessions");
+        let global_root = base.join("home").join("extra-codex-sessions");
+        let local_root = base.join("project").join("project-codex-sessions");
+
+        fs::create_dir_all(&roots.global_root).expect("global vault root should be created");
+        fs::create_dir_all(roots.local_root.as_ref().unwrap())
+            .expect("local vault root should be created");
+        fs::create_dir_all(&default_root).expect("default Codex root should be created");
+        fs::create_dir_all(&global_root).expect("global Codex root should be created");
+        fs::create_dir_all(&local_root).expect("local Codex root should be created");
+
+        fs::write(
+            vault_settings_path(&roots.global_root),
+            r#"{"codex_session_roots":["extra-codex-sessions"]}"#,
+        )
+        .expect("global settings should be writable");
+        fs::write(
+            vault_settings_path(roots.local_root.as_ref().unwrap()),
+            r#"{"codex_session_roots":[{"path":"project-codex-sessions"}]}"#,
+        )
+        .expect("local settings should be writable");
+
+        let session_roots =
+            resolve_codex_session_log_roots(&roots, &base.join("project"), &home_dir)
+                .expect("Codex session log roots should resolve");
+
+        assert_eq!(session_roots.len(), 3);
+        assert_eq!(
+            session_roots[0].path,
+            default_root
+                .canonicalize()
+                .expect("default root should canonicalize")
+        );
+        assert_eq!(session_roots[0].source, SessionLogRootSource::KnownDefault);
+        assert_eq!(
+            session_roots[1].path,
+            global_root
+                .canonicalize()
+                .expect("global root should canonicalize")
+        );
+        assert_eq!(
+            session_roots[1].source,
+            SessionLogRootSource::VaultSettings {
+                path: vault_settings_path(&roots.global_root),
+                scope: VaultScope::Global,
+            }
+        );
+        assert_eq!(
+            session_roots[2].path,
+            local_root
+                .canonicalize()
+                .expect("local root should canonicalize")
+        );
+
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_claude_session_log_roots_must_be_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "ctx-claude-session-roots-unreadable-{}",
+            Uuid::new_v4()
+        ));
+        let roots = VaultRoots {
+            global_root: base.join("home").join(".ctx").join("vault"),
+            local_root: None,
+        };
+        let home_dir = base.join("home");
+        let unreadable_root = home_dir.join(".claude").join("projects");
+
+        fs::create_dir_all(&roots.global_root).expect("global vault root should be created");
+        fs::create_dir_all(&unreadable_root).expect("default Claude root should be created");
+        let mut permissions = fs::metadata(&unreadable_root)
+            .expect("default Claude root metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&unreadable_root, permissions)
+            .expect("default Claude root should be made unreadable");
+
+        let error = resolve_claude_session_log_roots(&roots, &base, &home_dir)
+            .expect_err("unreadable Claude session log root should fail");
+
+        let mut restore_permissions = fs::metadata(&unreadable_root)
+            .expect("default Claude root metadata should still be readable")
+            .permissions();
+        restore_permissions.set_mode(0o700);
+        fs::set_permissions(&unreadable_root, restore_permissions)
+            .expect("default Claude root permissions should be restored");
+
+        assert!(error.to_string().contains("Claude session log root"));
+        assert!(error.to_string().contains("is not readable"));
 
         fs::remove_dir_all(base).ok();
     }

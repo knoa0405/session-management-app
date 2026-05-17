@@ -68,6 +68,41 @@ temporary prompt files, stale managed `AGENTS.md` marker blocks in the current
 directory, and transient wrapper state for child processes that are no longer
 active.
 
+## Session handoff storage schema
+
+Saved previous-session handoffs live as Markdown files under
+`.ctx/vault/contexts/session-history/` for the project-local vault, or the same
+`contexts/session-history/` folder in the resolved global vault. Each saved
+entry is a launch-ready Markdown body with CTX-owned YAML frontmatter. CTX
+validates the structured fields before writing, then reads the file back through
+the same schema so malformed saved entries fail instead of becoming generic
+markdown context.
+
+The persisted frontmatter uses `session_handoff_format_version: 1` and includes
+the required MVP handoff fields:
+
+- `source_tool`: `claude` or `codex`.
+- `source_session_ref`: original session ID or stable file-derived reference.
+- `source_working_directory`: working directory captured from the original log.
+- `title`: human-readable session title.
+- `summary`: concise completed-work summary.
+- `key_changed_files`: important files changed or discussed.
+- `decisions`: important decisions made during the session.
+- `verification_results`: tests, checks, or validations from the session.
+- `remaining_work`: follow-up tasks or unresolved items.
+- `created_at`: timestamp for the saved reusable entry.
+- `tags`: normalized labels, including session-history/resume-context tags.
+- `cleanup_applied`: whether sensitive/noisy transcript content was cleaned.
+- `refine_mode`: `raw` or `refined`.
+- `launch_target`: `claude` or `codex`.
+- `injection_method`: `append-system-prompt-file` for Claude or
+  `agents-md-section-marker-merge` for Codex.
+
+Additional saved metadata records the source log path, source update timestamp,
+work-context category and categories, classification status/confidence/rationale,
+goals, commands, and distillation focus. The Markdown body after the frontmatter
+is the `handoff_markdown` payload used for automatic launch injection.
+
 ## Preset execution schema
 
 Preset files live under `presets/*.json` inside the resolved global or local
